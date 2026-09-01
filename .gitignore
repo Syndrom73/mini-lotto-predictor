@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Dane i wytrenowane modele
+*.pt
+*.pth
+wyniki-minilotto.csv
+data/
+models/
