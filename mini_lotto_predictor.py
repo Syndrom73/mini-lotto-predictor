@@ -30,13 +30,16 @@ Google Colab:
 
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import math
 import os
 import random
 import warnings
+from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
+from io import StringIO
 from itertools import combinations
 from math import comb
 from pathlib import Path
@@ -1102,7 +1105,7 @@ def _format_numbers(numbers: Sequence[int]) -> str:
     return " ".join(f"{int(number):02d}" for number in sorted(numbers))
 
 
-def print_complete_draw_summary(
+def _emit_complete_draw_summary(
     history: pd.DataFrame,
     previous_prediction: Optional[StoredPrediction],
     next_prediction: Prediction,
@@ -1186,6 +1189,24 @@ def print_complete_draw_summary(
         print(f"{rank:2d}. {number:02d}  {score:.6f}")
 
 
+def print_complete_draw_summary(
+    history: pd.DataFrame,
+    previous_prediction: Optional[StoredPrediction],
+    next_prediction: Prediction,
+    top_n: int = 15,
+) -> str:
+    """Wyświetla raport i zwraca jego tekst do zapisu przez automatyzację."""
+
+    buffer = StringIO()
+    with redirect_stdout(buffer):
+        _emit_complete_draw_summary(
+            history, previous_prediction, next_prediction, top_n=top_n
+        )
+    report = buffer.getvalue()
+    print(report, end="")
+    return report
+
+
 # ============================================================
 # 12. PEŁNY ZAPIS I ODCZYT BUNDLE
 # ============================================================
@@ -1246,6 +1267,24 @@ def load_bundle(path: str = "mini_lotto_bundle.pt") -> PredictorBundle:
     )
 
 
+def refresh_bundle_history(
+    bundle: PredictorBundle,
+    history: pd.DataFrame,
+) -> PredictorBundle:
+    """Podmienia historię bez ponownego trenowania modelu."""
+
+    modern = get_modern_history(history)
+    next_features = build_next_draw_features(modern, infer_next_draw_date(modern))
+    if len(next_features) != bundle.input_dim:
+        raise ValueError(
+            f"Model oczekuje {bundle.input_dim} cech, a aktualny kod tworzy "
+            f"{len(next_features)}. Wykonaj pełny trening."
+        )
+    bundle.modern_history = modern
+    bundle.history_matrix = history_to_matrix(modern)
+    return bundle
+
+
 # ============================================================
 # 13. MAIN
 # ============================================================
@@ -1253,6 +1292,7 @@ def load_bundle(path: str = "mini_lotto_bundle.pt") -> PredictorBundle:
 def resolve_csv_path(explicit_path: Optional[str] = None) -> str:
     candidates = [
         explicit_path,
+        "/content/drive/MyDrive/MiniLotto/wyniki-minilotto.csv",
         "/content/wyniki-minilotto.csv",       # Google Colab
         "/mnt/data/wyniki-minilotto.csv",      # środowiska notebookowe
         "wyniki-minilotto.csv",                # bieżący katalog
@@ -1268,47 +1308,87 @@ def main(
     csv_path: Optional[str] = None,
     next_draw_date: Optional[str] = None,
     bundle_path: str = "mini_lotto_bundle.pt",
-) -> None:
+    mode: str = "train",
+    state_path: Optional[str] = None,
+    report_path: Optional[str] = None,
+) -> Prediction:
+    mode = mode.lower().strip()
+    if mode not in {"daily", "train"}:
+        raise ValueError("Tryb musi mieć wartość 'daily' albo 'train'.")
     warnings.filterwarnings("default")
     set_seed(SEED)
     selected_path = resolve_csv_path(csv_path)
     history = load_history(selected_path)
-    state_path = prediction_state_path(bundle_path)
-    previous_prediction = load_prediction_state(state_path)
+    state_file = Path(state_path) if state_path else prediction_state_path(bundle_path)
+    previous_prediction = load_prediction_state(state_file)
     print(f"Plik: {selected_path}")
+    print(f"Tryb: {'codzienna predykcja' if mode == 'daily' else 'pełny trening'}")
     print(f"Pełny snapshot: {len(history)} losowań")
     print("Ostatni rekord:")
     print(history[["Numer", "Date", *NUMBER_COLUMNS]].tail(1).to_string(index=False))
 
-    modern = get_modern_history(history)
-    X, Y = build_dataset(modern)
-    if CFG.walk_forward_enabled:
-        expanding_walk_forward(modern, X, Y)
+    if mode == "daily":
+        if not Path(bundle_path).is_file():
+            raise FileNotFoundError(
+                f"Brak zapisanego modelu {bundle_path}. Najpierw uruchom tryb train."
+            )
+        bundle = refresh_bundle_history(load_bundle(bundle_path), history)
+        print("Wczytano zapisany model; pominięto trening i walk-forward.")
+    else:
+        modern = get_modern_history(history)
+        X, Y = build_dataset(modern)
+        if CFG.walk_forward_enabled:
+            expanding_walk_forward(modern, X, Y)
 
-    # Ponownie ustawiamy bazowe ziarno, aby wynik głównego modelu nie zależał
-    # od liczby foldów walk-forward.
-    set_seed(SEED)
-    bundle = train_predictor(history)
+        # Ponownie ustawiamy bazowe ziarno, aby wynik głównego modelu nie zależał
+        # od liczby foldów walk-forward.
+        set_seed(SEED)
+        bundle = train_predictor(history)
+        save_bundle(bundle, bundle_path)
 
     explicit_date = pd.Timestamp(next_draw_date) if next_draw_date else None
     prediction = predict_next_draw(bundle, explicit_date)
-    print_complete_draw_summary(history, previous_prediction, prediction)
-    save_bundle(bundle, bundle_path)
-    save_prediction_state(prediction, state_path)
+    report = print_complete_draw_summary(history, previous_prediction, prediction)
+    save_prediction_state(prediction, state_file)
+    if report_path:
+        destination = Path(report_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(report.lstrip(), encoding="utf-8")
+        os.replace(temporary, destination)
+        print(f"Raport zapisany: {destination.resolve()}")
+    return prediction
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Analiza i predykcja Mini Lotto")
+    parser.add_argument("--csv-path", default=None)
+    parser.add_argument("--next-draw-date", default=None)
+    parser.add_argument("--bundle-path", default=None)
+    parser.add_argument("--state-path", default=None)
+    parser.add_argument("--report-path", default=None)
+    parser.add_argument(
+        "--mode", choices=("daily", "train"), default="train",
+        help="daily używa zapisanego modelu; train wykonuje pełny trening",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # Możesz wpisać jawne wartości, np.:
-    # CSV_PATH = "/content/wyniki-minilotto.csv"
-    # NEXT_DRAW_DATE = "2026-09-02"
-    CSV_PATH = None
-    NEXT_DRAW_DATE = None
+    arguments = parse_arguments()
     # Po zamontowaniu Dysku Google w Colabie model i poprzednia prognoza
     # przetrwają zamknięcie sesji. Poza Colabem używany jest katalog lokalny.
     GOOGLE_DRIVE_ROOT = Path("/content/drive/MyDrive")
-    BUNDLE_PATH = str(
+    default_bundle_path = str(
         GOOGLE_DRIVE_ROOT / "MiniLotto" / "mini_lotto_bundle.pt"
         if GOOGLE_DRIVE_ROOT.is_dir()
         else Path("mini_lotto_bundle.pt")
     )
-    main(CSV_PATH, NEXT_DRAW_DATE, BUNDLE_PATH)
+    main(
+        csv_path=arguments.csv_path,
+        next_draw_date=arguments.next_draw_date,
+        bundle_path=arguments.bundle_path or default_bundle_path,
+        mode=arguments.mode,
+        state_path=arguments.state_path,
+        report_path=arguments.report_path,
+    )
