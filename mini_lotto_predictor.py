@@ -30,6 +30,7 @@ Google Colab:
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import random
@@ -967,6 +968,223 @@ def audit_prediction(prediction: Prediction, actual_numbers: Sequence[int]) -> P
     )
 
 
+@dataclass
+class StoredPrediction:
+    """Minimalny, trwały zapis typów potrzebny do audytu po losowaniu."""
+
+    draw_number: int
+    draw_date: pd.Timestamp
+    set_1: Individual
+    set_2: Individual
+
+
+def prediction_state_path(bundle_path: str) -> Path:
+    """Umieszcza stan predykcji obok bundle, także na Dysku Google."""
+
+    bundle = Path(bundle_path)
+    return bundle.with_name(f"{bundle.stem}_last_prediction.json")
+
+
+def save_prediction_state(prediction: Prediction, path: Path) -> None:
+    """Zapisuje typy atomowo, aby przerwane zapisy nie uszkodziły stanu."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "draw_number": int(prediction.next_draw_number),
+        "draw_date": prediction.next_draw_date.date().isoformat(),
+        "set_1": [int(number) for number in prediction.set_1],
+        "set_2": [int(number) for number in prediction.set_2],
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+    print(f"Predykcja do późniejszego audytu zapisana: {path.resolve()}")
+
+
+def load_prediction_state(path: Path) -> Optional[StoredPrediction]:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1:
+            raise ValueError("nieobsługiwana wersja pliku stanu")
+        set_1 = tuple(sorted(int(number) for number in payload["set_1"]))
+        set_2 = tuple(sorted(int(number) for number in payload["set_2"]))
+        for numbers in (set_1, set_2):
+            if len(numbers) != CFG.draw_size or len(set(numbers)) != CFG.draw_size:
+                raise ValueError("zapisany zestaw nie zawiera 5 różnych liczb")
+            if min(numbers) < 1 or max(numbers) > CFG.n_numbers:
+                raise ValueError("zapisany zestaw jest poza zakresem 1..42")
+        return StoredPrediction(
+            draw_number=int(payload["draw_number"]),
+            draw_date=pd.Timestamp(payload["draw_date"]),
+            set_1=set_1,
+            set_2=set_2,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        warnings.warn(f"Pomijam niepoprawny plik stanu predykcji {path}: {exc}")
+        return None
+
+
+def _draw_numbers(row: pd.Series) -> List[int]:
+    return sorted(int(row[column]) for column in NUMBER_COLUMNS)
+
+
+def analyze_latest_draw(history: pd.DataFrame) -> dict:
+    """Opisuje ostatnie losowanie na tle wyłącznie wcześniejszej historii."""
+
+    modern = get_modern_history(history)
+    latest = modern.iloc[-1]
+    numbers = _draw_numbers(latest)
+    before = modern.iloc[:-1].reset_index(drop=True)
+    before_matrix = history_to_matrix(before) if len(before) else np.empty((0, CFG.n_numbers))
+
+    previous_numbers: set[int] = set()
+    if len(modern) >= 2:
+        previous_numbers = set(_draw_numbers(modern.iloc[-2]))
+
+    gaps_before = {}
+    frequencies_50 = {}
+    recent = before_matrix[-50:]
+    for number in numbers:
+        index = number - 1
+        appearances = np.flatnonzero(before_matrix[:, index] > 0)
+        gaps_before[number] = (
+            len(before_matrix) + 1
+            if len(appearances) == 0
+            else len(before_matrix) - int(appearances[-1])
+        )
+        frequencies_50[number] = (
+            0.0 if len(recent) == 0 else float(recent[:, index].mean())
+        )
+
+    consecutive_pairs = [
+        (left, right)
+        for left, right in zip(numbers, numbers[1:])
+        if right - left == 1
+    ]
+    return {
+        "draw_number": int(latest["Numer"]),
+        "draw_date": pd.Timestamp(latest["Date"]),
+        "numbers": numbers,
+        "sum": int(sum(numbers)),
+        "odd": int(sum(number % 2 == 1 for number in numbers)),
+        "even": int(sum(number % 2 == 0 for number in numbers)),
+        "low": int(sum(number <= CFG.n_numbers // 2 for number in numbers)),
+        "high": int(sum(number > CFG.n_numbers // 2 for number in numbers)),
+        "spread": int(max(numbers) - min(numbers)),
+        "consecutive_pairs": consecutive_pairs,
+        "repeated_from_previous": sorted(set(numbers) & previous_numbers),
+        "gaps_before": gaps_before,
+        "frequencies_50": frequencies_50,
+    }
+
+
+def audit_stored_prediction(
+    history: pd.DataFrame,
+    stored: Optional[StoredPrediction],
+) -> Optional[PredictionAudit]:
+    if stored is None:
+        return None
+    matching = history.loc[history["Numer"] == stored.draw_number]
+    if matching.empty:
+        return None
+    actual_numbers = _draw_numbers(matching.iloc[-1])
+    return audit_prediction(stored, actual_numbers)
+
+
+def _format_numbers(numbers: Sequence[int]) -> str:
+    return " ".join(f"{int(number):02d}" for number in sorted(numbers))
+
+
+def print_complete_draw_summary(
+    history: pd.DataFrame,
+    previous_prediction: Optional[StoredPrediction],
+    next_prediction: Prediction,
+    top_n: int = 15,
+) -> None:
+    """Jeden raport: analiza wyniku, audyt typów i dwa kolejne zestawy."""
+
+    analysis = analyze_latest_draw(history)
+    audit = audit_stored_prediction(history, previous_prediction)
+
+    print("\n" + "=" * 62)
+    print(f"PODSUMOWANIE PO LOSOWANIU MINI LOTTO {analysis['draw_number']}")
+    print(f"DATA LOSOWANIA: {analysis['draw_date'].date()}")
+    print("=" * 62)
+    print(f"WYLOSOWANE LICZBY: {_format_numbers(analysis['numbers'])}")
+    print(f"Suma: {analysis['sum']} | Rozstęp: {analysis['spread']}")
+    print(
+        f"Nieparzyste/parzyste: {analysis['odd']}/{analysis['even']} | "
+        f"Zakres 1–21/22–42: {analysis['low']}/{analysis['high']}"
+    )
+    pairs = analysis["consecutive_pairs"]
+    print(
+        "Pary kolejne: "
+        + (", ".join(f"{a:02d}-{b:02d}" for a, b in pairs) if pairs else "brak")
+    )
+    repeats = analysis["repeated_from_previous"]
+    print(
+        "Powtórzone z poprzedniego losowania: "
+        + (_format_numbers(repeats) if repeats else "brak")
+    )
+    print(
+        "Przerwy przed wystąpieniem: "
+        + ", ".join(
+            f"{number:02d}: {analysis['gaps_before'][number]}"
+            for number in analysis["numbers"]
+        )
+    )
+    print(
+        "Częstość w poprzednich 50 losowaniach: "
+        + ", ".join(
+            f"{number:02d}: {100 * analysis['frequencies_50'][number]:.1f}%"
+            for number in analysis["numbers"]
+        )
+    )
+
+    print("\nOCENA POPRZEDNIEJ PROGNOZY")
+    print("-" * 62)
+    if previous_prediction is None:
+        print("Brak wcześniejszego pliku predykcji — audyt rozpocznie się od następnego losowania.")
+    elif audit is None:
+        print(
+            f"Zapisane zestawy oczekują na losowanie "
+            f"{previous_prediction.draw_number}."
+        )
+    else:
+        print(f"Oceniane losowanie: {previous_prediction.draw_number}")
+        hit_numbers_1 = set(previous_prediction.set_1) & audit.actual_numbers
+        hit_numbers_2 = set(previous_prediction.set_2) & audit.actual_numbers
+        print(
+            f"ZESTAW 1: {_format_numbers(previous_prediction.set_1)} | "
+            f"trafienia: {audit.set1_hits} "
+            f"({_format_numbers(hit_numbers_1) if hit_numbers_1 else 'brak'})"
+        )
+        print(
+            f"ZESTAW 2: {_format_numbers(previous_prediction.set_2)} | "
+            f"trafienia: {audit.set2_hits} "
+            f"({_format_numbers(hit_numbers_2) if hit_numbers_2 else 'brak'})"
+        )
+        print(f"Najlepszy wynik dwóch zestawów: {audit.best_hits}/5")
+
+    print("\n" + "=" * 62)
+    print(f"PROGNOZA NASTĘPNEGO LOSOWANIA MINI LOTTO {next_prediction.next_draw_number}")
+    print(f"PRZEWIDYWANA DATA: {next_prediction.next_draw_date.date()}")
+    print("=" * 62)
+    print(f"ZESTAW 1: {_format_numbers(next_prediction.set_1)}")
+    print(f"ZESTAW 2: {_format_numbers(next_prediction.set_2)}")
+    overlap = len(set(next_prediction.set_1) & set(next_prediction.set_2))
+    print(f"Wspólne liczby zestawów: {overlap}")
+    print("\nTOP RANKING (score modelowy, nie gwarancja trafienia):")
+    for rank, (number, score) in enumerate(next_prediction.ranking[:top_n], 1):
+        print(f"{rank:2d}. {number:02d}  {score:.6f}")
+
+
 # ============================================================
 # 12. PEŁNY ZAPIS I ODCZYT BUNDLE
 # ============================================================
@@ -1054,6 +1272,8 @@ def main(
     set_seed(SEED)
     selected_path = resolve_csv_path(csv_path)
     history = load_history(selected_path)
+    state_path = prediction_state_path(bundle_path)
+    previous_prediction = load_prediction_state(state_path)
     print(f"Plik: {selected_path}")
     print(f"Pełny snapshot: {len(history)} losowań")
     print("Ostatni rekord:")
@@ -1071,8 +1291,9 @@ def main(
 
     explicit_date = pd.Timestamp(next_draw_date) if next_draw_date else None
     prediction = predict_next_draw(bundle, explicit_date)
-    print_prediction(prediction)
+    print_complete_draw_summary(history, previous_prediction, prediction)
     save_bundle(bundle, bundle_path)
+    save_prediction_state(prediction, state_path)
 
 
 if __name__ == "__main__":
