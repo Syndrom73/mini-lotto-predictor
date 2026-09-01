@@ -23,8 +23,9 @@ Wymagania:
 
 Google Colab:
   1. Wgraj plik wyniki-minilotto.csv do /content/.
-  2. Opcjonalnie ustaw CSV_PATH i NEXT_DRAW_DATE na końcu pliku.
-  3. Uruchom cały kod.
+  2. Zamontuj Dysk Google, aby zachować model i poprzednią prognozę.
+  3. Opcjonalnie ustaw CSV_PATH i NEXT_DRAW_DATE na końcu pliku.
+  4. Uruchom cały kod.
 """
 
 from __future__ import annotations
@@ -1302,5 +1303,12 @@ if __name__ == "__main__":
     # NEXT_DRAW_DATE = "2026-09-02"
     CSV_PATH = None
     NEXT_DRAW_DATE = None
-    BUNDLE_PATH = "mini_lotto_bundle.pt"
+    # Po zamontowaniu Dysku Google w Colabie model i poprzednia prognoza
+    # przetrwają zamknięcie sesji. Poza Colabem używany jest katalog lokalny.
+    GOOGLE_DRIVE_ROOT = Path("/content/drive/MyDrive")
+    BUNDLE_PATH = str(
+        GOOGLE_DRIVE_ROOT / "MiniLotto" / "mini_lotto_bundle.pt"
+        if GOOGLE_DRIVE_ROOT.is_dir()
+        else Path("mini_lotto_bundle.pt")
+    )
     main(CSV_PATH, NEXT_DRAW_DATE, BUNDLE_PATH)
