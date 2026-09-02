@@ -97,6 +97,9 @@ class Config:
     pair_score_weight: float = 0.20
     spread_weight: float = 0.04
     max_overlap: int = 0
+    # Każdy nowy zestaw musi zmienić co najmniej 2 liczby względem
+    # każdego zestawu typowanego na poprzednie losowanie.
+    max_previous_overlap: int = 3
 
     # Prawdziwy expanding-window walk-forward.
     # Jest kosztowny, ponieważ każdy fold trenuje nową sieć.
@@ -706,20 +709,32 @@ def exact_best_set(
     pair_matrix: np.ndarray,
     forbidden_set: Optional[Individual] = None,
     max_overlap: Optional[int] = None,
+    overlap_constraints: Optional[Sequence[Tuple[Individual, int]]] = None,
 ) -> Tuple[Individual, float]:
     max_overlap = CFG.max_overlap if max_overlap is None else max_overlap
-    forbidden = set(forbidden_set or ())
+    constraints: List[Tuple[set[int], int]] = []
+    if forbidden_set:
+        constraints.append((set(forbidden_set), max_overlap))
+    for numbers, limit in overlap_constraints or ():
+        if not 0 <= limit <= CFG.draw_size:
+            raise ValueError("Limit wspólnych liczb musi należeć do zakresu 0..5.")
+        constraints.append((set(numbers), int(limit)))
+
     best_set: Optional[Individual] = None
     best_fitness = -float("inf")
     for candidate in combinations(range(1, CFG.n_numbers + 1), CFG.draw_size):
-        if forbidden and len(set(candidate) & forbidden) > max_overlap:
+        candidate_numbers = set(candidate)
+        if any(
+            len(candidate_numbers & blocked) > limit
+            for blocked, limit in constraints
+        ):
             continue
         value = set_fitness(candidate, probabilities, pair_matrix)
         if value > best_fitness:
             best_set = candidate
             best_fitness = value
     if best_set is None:
-        raise RuntimeError("Nie znaleziono zestawu spełniającego ograniczenie overlapu.")
+        raise RuntimeError("Nie znaleziono zestawu spełniającego ograniczenia overlapu.")
     return best_set, best_fitness
 
 
@@ -739,11 +754,27 @@ def generate_two_sets(
     history: np.ndarray,
     next_draw_number: int,
     next_draw_date: pd.Timestamp,
+    previous_prediction: Optional["StoredPrediction"] = None,
 ) -> Prediction:
     pair_matrix = regularized_pair_matrix(history, len(history), CFG.pair_window)
-    set_1, fitness_1 = exact_best_set(final_probabilities, pair_matrix)
+    previous_constraints: List[Tuple[Individual, int]] = []
+    if previous_prediction is not None:
+        previous_constraints = [
+            (previous_prediction.set_1, CFG.max_previous_overlap),
+            (previous_prediction.set_2, CFG.max_previous_overlap),
+        ]
+
+    set_1, fitness_1 = exact_best_set(
+        final_probabilities,
+        pair_matrix,
+        overlap_constraints=previous_constraints,
+    )
     set_2, fitness_2 = exact_best_set(
-        final_probabilities, pair_matrix, forbidden_set=set_1, max_overlap=CFG.max_overlap
+        final_probabilities,
+        pair_matrix,
+        forbidden_set=set_1,
+        max_overlap=CFG.max_overlap,
+        overlap_constraints=previous_constraints,
     )
     ranking_indexes = np.argsort(final_probabilities)[::-1]
     ranking = [(int(i + 1), float(final_probabilities[i])) for i in ranking_indexes]
@@ -828,7 +859,9 @@ def build_next_draw_features(df: pd.DataFrame, next_draw_date: pd.Timestamp) -> 
 
 
 def predict_next_draw(
-    bundle: PredictorBundle, next_draw_date: Optional[pd.Timestamp] = None
+    bundle: PredictorBundle,
+    next_draw_date: Optional[pd.Timestamp] = None,
+    previous_prediction: Optional["StoredPrediction"] = None,
 ) -> Prediction:
     if next_draw_date is None:
         next_draw_date = infer_next_draw_date(bundle.modern_history)
@@ -842,8 +875,11 @@ def predict_next_draw(
     )
     last_number = int(bundle.modern_history.iloc[-1]["Numer"])
     return generate_two_sets(
-        final_probability, bundle.history_matrix, last_number + 1,
-        pd.Timestamp(next_draw_date)
+        final_probability,
+        bundle.history_matrix,
+        last_number + 1,
+        pd.Timestamp(next_draw_date),
+        previous_prediction=previous_prediction,
     )
 
 
@@ -1176,6 +1212,21 @@ def _emit_complete_draw_summary(
         )
         print(f"Najlepszy wynik dwóch zestawów: {audit.best_hits}/5")
 
+    print("\nWNIOSKI I REAKCJA MODELU")
+    print("-" * 62)
+    print("Do nowej prognozy użyto historii obejmującej ocenione losowanie.")
+    if audit is None:
+        print("Brak zakończonego audytu, więc nie zastosowano oceny trafień.")
+    else:
+        print(
+            f"Audyt: zestaw 1 trafił {audit.set1_hits}/5, "
+            f"zestaw 2 trafił {audit.set2_hits}/5."
+        )
+        print(
+            "Filtr rotacji nie pozwala powtórzyć poprzednich zestawów "
+            "i wymusza zmianę co najmniej 2 liczb w każdym nowym zestawie."
+        )
+
     print("\n" + "=" * 62)
     print(f"PROGNOZA NASTĘPNEGO LOSOWANIA MINI LOTTO {next_prediction.next_draw_number}")
     print(f"PRZEWIDYWANA DATA: {next_prediction.next_draw_date.date()}")
@@ -1184,6 +1235,17 @@ def _emit_complete_draw_summary(
     print(f"ZESTAW 2: {_format_numbers(next_prediction.set_2)}")
     overlap = len(set(next_prediction.set_1) & set(next_prediction.set_2))
     print(f"Wspólne liczby zestawów: {overlap}")
+    if previous_prediction is not None and audit is not None:
+        previous_sets = (set(previous_prediction.set_1), set(previous_prediction.set_2))
+        for index, new_set in enumerate((next_prediction.set_1, next_prediction.set_2), 1):
+            max_previous_common = max(
+                len(set(new_set) & old_set) for old_set in previous_sets
+            )
+            print(
+                f"Zmiana zestawu {index}: co najmniej "
+                f"{CFG.draw_size - max_previous_common} liczby względem "
+                "każdego poprzedniego zestawu"
+            )
     print("\nTOP RANKING (score modelowy, nie gwarancja trafienia):")
     for rank, (number, score) in enumerate(next_prediction.ranking[:top_n], 1):
         print(f"{rank:2d}. {number:02d}  {score:.6f}")
@@ -1327,6 +1389,26 @@ def main(
     print("Ostatni rekord:")
     print(history[["Numer", "Date", *NUMBER_COLUMNS]].tail(1).to_string(index=False))
 
+    latest_draw_number = int(get_modern_history(history).iloc[-1]["Numer"])
+    if (
+        previous_prediction is not None
+        and previous_prediction.draw_number > latest_draw_number
+    ):
+        print(
+            f"Brak nowego losowania: prognoza na losowanie "
+            f"{previous_prediction.draw_number} nadal oczekuje na wynik. "
+            "Nie zmieniam zestawów ani pliku stanu."
+        )
+        return Prediction(
+            previous_prediction.draw_number,
+            previous_prediction.draw_date,
+            previous_prediction.set_1,
+            previous_prediction.set_2,
+            float("nan"),
+            float("nan"),
+            [],
+        )
+
     if mode == "daily":
         if not Path(bundle_path).is_file():
             raise FileNotFoundError(
@@ -1347,7 +1429,11 @@ def main(
         save_bundle(bundle, bundle_path)
 
     explicit_date = pd.Timestamp(next_draw_date) if next_draw_date else None
-    prediction = predict_next_draw(bundle, explicit_date)
+    prediction = predict_next_draw(
+        bundle,
+        explicit_date,
+        previous_prediction=previous_prediction,
+    )
     report = print_complete_draw_summary(history, previous_prediction, prediction)
     save_prediction_state(prediction, state_file)
     if report_path:
