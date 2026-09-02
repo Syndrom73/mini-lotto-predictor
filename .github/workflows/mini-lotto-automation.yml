@@ -119,6 +119,7 @@ jobs:
         run: |
           draw_number="$(grep -m1 -oP 'PO LOSOWANIU MINI LOTTO \K[0-9]+' reports/latest.md)"
           report_date="$(TZ=Europe/Warsaw date +%F)"
+          mkdir -p reports/archive
           cp reports/latest.md "reports/archive/${report_date}_losowanie_${draw_number}.md"
 
       - name: Zachowaj wytrenowany model
