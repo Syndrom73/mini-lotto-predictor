@@ -17,13 +17,21 @@ ZESTAW 1: 03 26 32 36 41 | trafienia: 0 (brak)
 ZESTAW 2: 01 05 22 34 42 | trafienia: 2 (05 22)
 Najlepszy wynik dwóch zestawów: 2/5
 
+WNIOSKI I REAKCJA MODELU
+--------------------------------------------------------------
+Do nowej prognozy użyto historii obejmującej ocenione losowanie.
+Audyt: zestaw 1 trafił 0/5, zestaw 2 trafił 2/5.
+Filtr rotacji nie pozwala powtórzyć poprzednich zestawów i wymusza zmianę co najmniej 2 liczb w każdym nowym zestawie.
+
 ==============================================================
 PROGNOZA NASTĘPNEGO LOSOWANIA MINI LOTTO 7430
 PRZEWIDYWANA DATA: 2026-09-02
 ==============================================================
-ZESTAW 1: 03 26 32 36 41
-ZESTAW 2: 01 05 22 34 42
+ZESTAW 1: 04 15 20 37 39
+ZESTAW 2: 01 05 12 14 36
 Wspólne liczby zestawów: 0
+Zmiana zestawu 1: co najmniej 5 liczby względem każdego poprzedniego zestawu
+Zmiana zestawu 2: co najmniej 3 liczby względem każdego poprzedniego zestawu
 
 TOP RANKING (score modelowy, nie gwarancja trafienia):
  1. 02  0.119091
