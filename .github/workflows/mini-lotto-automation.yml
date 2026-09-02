@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Tryb uruchomienia"
+        description: "Tryb: auto, codzienna analiza albo pełny trening"
         required: true
         default: auto
         type: choice
