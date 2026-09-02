@@ -85,7 +85,7 @@ jobs:
 
       - name: Pobierz i zweryfikuj wyniki
         if: steps.time_gate.outputs.run == 'true'
-        run: python automation/download_results.py --output wyniki-minilotto.csv
+        run: python -m automation.download_results --output wyniki-minilotto.csv
 
       - name: Wybierz tryb
         if: steps.time_gate.outputs.run == 'true'
