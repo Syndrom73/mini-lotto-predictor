@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import math
 import os
@@ -39,6 +40,7 @@ import random
 import warnings
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from io import StringIO
 from itertools import combinations
 from math import comb
@@ -91,6 +93,14 @@ class Config:
 
     # Ensemble
     default_nn_weight: float = 0.60
+    hybrid_max_weight: float = 0.50
+    hybrid_min_brier_improvement: float = 1e-5
+
+    # Temporalny CNN + MLP. CNN widzi macierz: czas x 42 liczby,
+    # a MLP pozostałe cechy statystyczne.
+    cnn_channels_1: int = 32
+    cnn_channels_2: int = 64
+    hybrid_context_hidden: int = 128
 
     # Dokładne wyszukiwanie zestawów
     individual_score_weight: float = 1.0
@@ -119,7 +129,7 @@ REQUIRED_COLUMNS = [
     "Numer", "Dzien", "Miesiac", "Rok", "L1", "L2", "L3", "L4", "L5"
 ]
 NUMBER_COLUMNS = ["L1", "L2", "L3", "L4", "L5"]
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 
 # ============================================================
@@ -370,6 +380,12 @@ def dataset_offset() -> int:
     return max(CFG.sequence_length, max(CFG.rolling_windows))
 
 
+def sequence_feature_count() -> int:
+    """Liczba początkowych cech należących do sekwencji losowań."""
+
+    return CFG.sequence_length * CFG.n_numbers
+
+
 def build_dataset(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     history = history_to_matrix(df)
     offset = dataset_offset()
@@ -443,6 +459,59 @@ class MiniLottoMLP(nn.Module):
         return self.network(x)
 
 
+class MiniLottoTemporalHybrid(nn.Module):
+    """Temporalny CNN dla historii oraz MLP dla cech statystycznych."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.sequence_features = sequence_feature_count()
+        context_dim = self.input_dim - self.sequence_features
+        if context_dim <= 0:
+            raise ValueError("Brak cech kontekstowych dla modelu hybrydowego.")
+
+        # Wejście CNN po reshape ma format [batch, liczby, czas]. Filtr
+        # przesuwa się wyłącznie po kolejnych losowaniach, a nie po przypadkowo
+        # ułożonych cechach statystycznych.
+        self.temporal = nn.Sequential(
+            nn.Conv1d(CFG.n_numbers, CFG.cnn_channels_1, kernel_size=3, padding=1),
+            nn.BatchNorm1d(CFG.cnn_channels_1),
+            nn.GELU(),
+            nn.Conv1d(
+                CFG.cnn_channels_1,
+                CFG.cnn_channels_2,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.BatchNorm1d(CFG.cnn_channels_2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+        self.context = nn.Sequential(
+            nn.Linear(context_dim, CFG.hybrid_context_hidden),
+            nn.BatchNorm1d(CFG.hybrid_context_hidden),
+            nn.GELU(),
+            nn.Dropout(CFG.dropout),
+            nn.Linear(CFG.hybrid_context_hidden, CFG.hidden_3),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(CFG.cnn_channels_2 + CFG.hidden_3, CFG.hidden_2),
+            nn.GELU(),
+            nn.Dropout(CFG.dropout),
+            nn.Linear(CFG.hidden_2, CFG.n_numbers),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sequence = x[:, :self.sequence_features].reshape(
+            -1, CFG.sequence_length, CFG.n_numbers
+        )
+        sequence = sequence.transpose(1, 2)
+        context = x[:, self.sequence_features:]
+        return self.head(torch.cat((self.temporal(sequence), self.context(context)), dim=1))
+
+
 class WeightedBCE(nn.Module):
     def __init__(self):
         super().__init__()
@@ -468,10 +537,17 @@ def train_model(
     Y_val: np.ndarray,
     epochs: Optional[int] = None,
     patience: Optional[int] = None,
+    architecture: str = "mlp",
 ) -> TrainingResult:
     epochs = CFG.epochs if epochs is None else epochs
     patience = CFG.patience if patience is None else patience
-    model = MiniLottoMLP(X_train.shape[1]).to(CFG.device)
+    if architecture == "mlp":
+        model: nn.Module = MiniLottoMLP(X_train.shape[1])
+    elif architecture == "hybrid":
+        model = MiniLottoTemporalHybrid(X_train.shape[1])
+    else:
+        raise ValueError(f"Nieznana architektura: {architecture}")
+    model = model.to(CFG.device)
     criterion = WeightedBCE()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=CFG.learning_rate, weight_decay=CFG.weight_decay
@@ -669,6 +745,54 @@ def optimize_ensemble_weight(
     return best_weight
 
 
+def blend_hybrid_probabilities(
+    base_predictions: np.ndarray,
+    hybrid_predictions: np.ndarray,
+    hybrid_weight: float,
+) -> np.ndarray:
+    mixed = (
+        (1.0 - hybrid_weight) * base_predictions
+        + hybrid_weight * hybrid_predictions
+    )
+    if mixed.ndim == 1:
+        return normalize_expected_count(mixed, CFG.draw_size)
+    return np.asarray(
+        [normalize_expected_count(row, CFG.draw_size) for row in mixed],
+        dtype=np.float64,
+    )
+
+
+def optimize_hybrid_weight(
+    base_predictions: np.ndarray,
+    hybrid_predictions: np.ndarray,
+    targets: np.ndarray,
+) -> float:
+    """Dopuszcza CNN tylko po mierzalnej poprawie Brier na walidacji."""
+
+    base_metrics = evaluate_scores(base_predictions, targets)
+    best_weight = 0.0
+    best_metrics = base_metrics
+    for weight in np.linspace(0.05, CFG.hybrid_max_weight, 10):
+        predictions = blend_hybrid_probabilities(
+            base_predictions, hybrid_predictions, float(weight)
+        )
+        metrics = evaluate_scores(predictions, targets)
+        if (
+            metrics.brier < best_metrics.brier
+            or (
+                math.isclose(metrics.brier, best_metrics.brier, abs_tol=1e-12)
+                and metrics.mean_hits > best_metrics.mean_hits
+            )
+        ):
+            best_weight = float(weight)
+            best_metrics = metrics
+
+    improvement = base_metrics.brier - best_metrics.brier
+    if improvement < CFG.hybrid_min_brier_improvement:
+        return 0.0
+    return best_weight
+
+
 def print_metrics(name: str, metrics: EvaluationMetrics) -> None:
     print("\n------------------------------")
     print(name)
@@ -747,6 +871,7 @@ class Prediction:
     set_1_fitness: float
     set_2_fitness: float
     ranking: List[Tuple[int, float]]
+    hybrid_weight: float = 0.0
 
 
 def generate_two_sets(
@@ -800,6 +925,11 @@ class PredictorBundle:
     modern_history: pd.DataFrame
     history_matrix: np.ndarray
     input_dim: int
+    hybrid_model: Optional[nn.Module] = None
+    hybrid_calibrator: Optional[LogisticRegression] = None
+    hybrid_weight: float = 0.0
+    base_validation_metrics: Optional[EvaluationMetrics] = None
+    hybrid_validation_metrics: Optional[EvaluationMetrics] = None
 
 
 def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
@@ -813,14 +943,35 @@ def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
     print(f"Współczesne losowania: {len(modern)}")
     print(f"Dataset X: {X.shape}, Y: {Y.shape}, device: {CFG.device}")
 
-    training = train_model(data.X_train, data.Y_train, data.X_val, data.Y_val)
-    print(f"Epoki: {training.epochs_run}, best val loss: {training.best_val_loss:.6f}")
+    set_seed(SEED)
+    training = train_model(
+        data.X_train, data.Y_train, data.X_val, data.Y_val, architecture="mlp"
+    )
+    print(
+        f"MLP — epoki: {training.epochs_run}, "
+        f"best val loss: {training.best_val_loss:.6f}"
+    )
+
+    set_seed(SEED + 1000)
+    hybrid_training = train_model(
+        data.X_train, data.Y_train, data.X_val, data.Y_val, architecture="hybrid"
+    )
+    print(
+        f"Temporalny CNN+MLP — epoki: {hybrid_training.epochs_run}, "
+        f"best val loss: {hybrid_training.best_val_loss:.6f}"
+    )
 
     val_logits = model_logits(training.model, data.X_val)
     test_logits = model_logits(training.model, data.X_test)
     calibrator = fit_platt_calibrator(val_logits, data.Y_val)
     nn_val = calibrated_nn_probabilities(calibrator, val_logits)
     nn_test = calibrated_nn_probabilities(calibrator, test_logits)
+
+    hybrid_val_logits = model_logits(hybrid_training.model, data.X_val)
+    hybrid_test_logits = model_logits(hybrid_training.model, data.X_test)
+    hybrid_calibrator = fit_platt_calibrator(hybrid_val_logits, data.Y_val)
+    hybrid_val = calibrated_nn_probabilities(hybrid_calibrator, hybrid_val_logits)
+    hybrid_test = calibrated_nn_probabilities(hybrid_calibrator, hybrid_test_logits)
 
     offset = dataset_offset()
     val_history_start = offset + data.val_start_dataset
@@ -829,21 +980,37 @@ def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
     stat_test = statistical_predictions(history, test_history_start, len(history))
 
     weight = optimize_ensemble_weight(nn_val, stat_val, data.Y_val)
-    val_predictions = ensemble_probabilities(nn_val, stat_val, weight)
-    test_predictions = ensemble_probabilities(nn_test, stat_test, weight)
+    base_val_predictions = ensemble_probabilities(nn_val, stat_val, weight)
+    base_test_predictions = ensemble_probabilities(nn_test, stat_test, weight)
+    hybrid_weight = optimize_hybrid_weight(
+        base_val_predictions, hybrid_val, data.Y_val
+    )
+    val_predictions = blend_hybrid_probabilities(
+        base_val_predictions, hybrid_val, hybrid_weight
+    )
+    test_predictions = blend_hybrid_probabilities(
+        base_test_predictions, hybrid_test, hybrid_weight
+    )
+    base_validation_metrics = evaluate_scores(base_val_predictions, data.Y_val)
+    hybrid_validation_metrics = evaluate_scores(hybrid_val, data.Y_val)
     validation_metrics = evaluate_scores(val_predictions, data.Y_val)
     test_metrics = evaluate_scores(test_predictions, data.Y_test)
     random_metrics = analytical_random_baseline()
 
-    print(f"Wybrana waga NN: {weight:.2f}")
-    print_metrics("VALIDATION", validation_metrics)
-    print_metrics("TEST", test_metrics)
+    print(f"Wybrana waga MLP względem statystyki: {weight:.2f}")
+    print(f"Dopuszczona waga temporalnego CNN: {hybrid_weight:.2f}")
+    print_metrics("VALIDATION — BAZOWE MLP+STAT", base_validation_metrics)
+    print_metrics("VALIDATION — SAM TEMPORALNY CNN+MLP", hybrid_validation_metrics)
+    print_metrics("VALIDATION — KOŃCOWY ENSEMBLE", validation_metrics)
+    print_metrics("TEST — KOŃCOWY ENSEMBLE", test_metrics)
     print_metrics("ANALITYCZNY RANDOM BASELINE", random_metrics)
 
     return PredictorBundle(
         training.model, data.scaler, calibrator, weight,
         validation_metrics, test_metrics, random_metrics,
-        modern, history, X.shape[1]
+        modern, history, X.shape[1],
+        hybrid_training.model, hybrid_calibrator, hybrid_weight,
+        base_validation_metrics, hybrid_validation_metrics,
     )
 
 
@@ -873,14 +1040,28 @@ def predict_next_draw(
     final_probability = ensemble_probabilities(
         nn_probability, stat_probability, bundle.ensemble_weight
     )
+    if (
+        bundle.hybrid_model is not None
+        and bundle.hybrid_calibrator is not None
+        and bundle.hybrid_weight > 0.0
+    ):
+        hybrid_logits = model_logits(bundle.hybrid_model, scaled)
+        hybrid_probability = calibrated_nn_probabilities(
+            bundle.hybrid_calibrator, hybrid_logits
+        )[0]
+        final_probability = blend_hybrid_probabilities(
+            final_probability, hybrid_probability, bundle.hybrid_weight
+        )
     last_number = int(bundle.modern_history.iloc[-1]["Numer"])
-    return generate_two_sets(
+    prediction = generate_two_sets(
         final_probability,
         bundle.history_matrix,
         last_number + 1,
         pd.Timestamp(next_draw_date),
         previous_prediction=previous_prediction,
     )
+    prediction.hybrid_weight = float(bundle.hybrid_weight)
+    return prediction
 
 
 def print_prediction(prediction: Prediction, top_n: int = 15) -> None:
@@ -947,12 +1128,30 @@ def expanding_walk_forward(
             X_train, Y_train, X_val, Y_val,
             epochs=CFG.walk_forward_epochs,
             patience=CFG.walk_forward_patience,
+            architecture="mlp",
         )
         val_logits = model_logits(trained.model, X_val)
         eval_logits = model_logits(trained.model, X_eval)
         calibrator = fit_platt_calibrator(val_logits, Y_val)
         nn_val = calibrated_nn_probabilities(calibrator, val_logits)
         nn_eval = calibrated_nn_probabilities(calibrator, eval_logits)
+
+        set_seed(SEED + 1000 + fold + 1)
+        hybrid_trained = train_model(
+            X_train, Y_train, X_val, Y_val,
+            epochs=CFG.walk_forward_epochs,
+            patience=CFG.walk_forward_patience,
+            architecture="hybrid",
+        )
+        hybrid_val_logits = model_logits(hybrid_trained.model, X_val)
+        hybrid_eval_logits = model_logits(hybrid_trained.model, X_eval)
+        hybrid_calibrator = fit_platt_calibrator(hybrid_val_logits, Y_val)
+        hybrid_val = calibrated_nn_probabilities(
+            hybrid_calibrator, hybrid_val_logits
+        )
+        hybrid_eval = calibrated_nn_probabilities(
+            hybrid_calibrator, hybrid_eval_logits
+        )
 
         stat_val = statistical_predictions(
             history, offset + validation_start, offset + evaluation_start
@@ -961,7 +1160,12 @@ def expanding_walk_forward(
             history, offset + evaluation_start, offset + evaluation_end
         )
         weight = optimize_ensemble_weight(nn_val, stat_val, Y_val)
-        predictions = ensemble_probabilities(nn_eval, stat_eval, weight)
+        base_val = ensemble_probabilities(nn_val, stat_val, weight)
+        base_eval = ensemble_probabilities(nn_eval, stat_eval, weight)
+        hybrid_weight = optimize_hybrid_weight(base_val, hybrid_val, Y_val)
+        predictions = blend_hybrid_probabilities(
+            base_eval, hybrid_eval, hybrid_weight
+        )
         metrics = evaluate_scores(predictions, Y_eval)
         folds.append(metrics)
         all_predictions.append(predictions)
@@ -969,7 +1173,8 @@ def expanding_walk_forward(
         print(
             f"Fold {fold + 1}/{CFG.walk_forward_folds}: "
             f"zakres dataset [{evaluation_start}:{evaluation_end}), "
-            f"waga NN={weight:.2f}, mean={metrics.mean_hits:.3f}, "
+            f"waga MLP={weight:.2f}, waga CNN={hybrid_weight:.2f}, "
+            f"mean={metrics.mean_hits:.3f}, "
             f">=3/5={100 * metrics.rate_ge_3:.3f}%"
         )
 
@@ -1137,6 +1342,99 @@ def audit_stored_prediction(
     return audit_prediction(stored, actual_numbers)
 
 
+PREDICTION_HISTORY_COLUMNS = [
+    "draw_number",
+    "draw_date",
+    "set_1",
+    "set_2",
+    "source_draw_number",
+    "created_at_utc",
+    "feature_version",
+    "hybrid_weight",
+    "actual_numbers",
+    "set_1_hits",
+    "set_2_hits",
+    "audited_at_utc",
+]
+
+
+def _csv_numbers(numbers: Sequence[int]) -> str:
+    return " ".join(str(int(number)) for number in sorted(numbers))
+
+
+def update_prediction_history(
+    path: Path,
+    history: pd.DataFrame,
+    previous_prediction: Optional[StoredPrediction],
+    next_prediction: Prediction,
+) -> None:
+    """Aktualizuje audyt poprzedniej prognozy i dopisuje następną."""
+
+    rows: List[dict] = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+    now = datetime.now(timezone.utc).isoformat()
+    audit = audit_stored_prediction(history, previous_prediction)
+    if previous_prediction is not None and audit is not None:
+        previous_key = str(previous_prediction.draw_number)
+        matching = next(
+            (row for row in rows if row.get("draw_number") == previous_key), None
+        )
+        if matching is None:
+            matching = {
+                column: "" for column in PREDICTION_HISTORY_COLUMNS
+            }
+            matching.update(
+                {
+                    "draw_number": previous_key,
+                    "draw_date": previous_prediction.draw_date.date().isoformat(),
+                    "set_1": _csv_numbers(previous_prediction.set_1),
+                    "set_2": _csv_numbers(previous_prediction.set_2),
+                }
+            )
+            rows.append(matching)
+        matching.update(
+            {
+                "actual_numbers": _csv_numbers(audit.actual_numbers),
+                "set_1_hits": str(audit.set1_hits),
+                "set_2_hits": str(audit.set2_hits),
+                "audited_at_utc": now,
+            }
+        )
+
+    next_key = str(next_prediction.next_draw_number)
+    rows = [row for row in rows if row.get("draw_number") != next_key]
+    source_draw_number = int(get_modern_history(history).iloc[-1]["Numer"])
+    rows.append(
+        {
+            "draw_number": next_key,
+            "draw_date": next_prediction.next_draw_date.date().isoformat(),
+            "set_1": _csv_numbers(next_prediction.set_1),
+            "set_2": _csv_numbers(next_prediction.set_2),
+            "source_draw_number": str(source_draw_number),
+            "created_at_utc": now,
+            "feature_version": str(FEATURE_VERSION),
+            "hybrid_weight": f"{next_prediction.hybrid_weight:.4f}",
+            "actual_numbers": "",
+            "set_1_hits": "",
+            "set_2_hits": "",
+            "audited_at_utc": "",
+        }
+    )
+    rows.sort(key=lambda row: int(row["draw_number"]))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PREDICTION_HISTORY_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, path)
+    print(f"Historia prognoz i audytów zapisana: {path.resolve()}")
+
+
 def _format_numbers(numbers: Sequence[int]) -> str:
     return " ".join(f"{int(number):02d}" for number in sorted(numbers))
 
@@ -1233,6 +1531,16 @@ def _emit_complete_draw_summary(
     print("=" * 62)
     print(f"ZESTAW 1: {_format_numbers(next_prediction.set_1)}")
     print(f"ZESTAW 2: {_format_numbers(next_prediction.set_2)}")
+    if next_prediction.hybrid_weight > 0.0:
+        print(
+            "Temporalny CNN+MLP: aktywny w ensemble, udział "
+            f"{100 * next_prediction.hybrid_weight:.0f}%"
+        )
+    else:
+        print(
+            "Temporalny CNN+MLP: udział 0% — nie wykazał wymaganej "
+            "poprawy Brier na walidacji"
+        )
     overlap = len(set(next_prediction.set_1) & set(next_prediction.set_2))
     print(f"Wspólne liczby zestawów: {overlap}")
     if previous_prediction is not None and audit is not None:
@@ -1243,7 +1551,7 @@ def _emit_complete_draw_summary(
             )
             print(
                 f"Zmiana zestawu {index}: co najmniej "
-                f"{CFG.draw_size - max_previous_common} liczby względem "
+                f"{CFG.draw_size - max_previous_common} liczb względem "
                 "każdego poprzedniego zestawu"
             )
     print("\nTOP RANKING (score modelowy, nie gwarancja trafienia):")
@@ -1289,6 +1597,13 @@ def save_bundle(bundle: PredictorBundle, path: str = "mini_lotto_bundle.pt") -> 
         "random_metrics": bundle.random_metrics,
         "modern_history": bundle.modern_history,
         "history_matrix": bundle.history_matrix,
+        "hybrid_model_state_dict": (
+            bundle.hybrid_model.state_dict() if bundle.hybrid_model is not None else None
+        ),
+        "hybrid_calibrator": bundle.hybrid_calibrator,
+        "hybrid_weight": float(bundle.hybrid_weight),
+        "base_validation_metrics": bundle.base_validation_metrics,
+        "hybrid_validation_metrics": bundle.hybrid_validation_metrics,
     }
     torch.save(payload, destination)
     print(f"Pełny bundle zapisany: {destination.resolve()}")
@@ -1315,6 +1630,12 @@ def load_bundle(path: str = "mini_lotto_bundle.pt") -> PredictorBundle:
     model = MiniLottoMLP(int(checkpoint["input_dim"]))
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(CFG.device).eval()
+    hybrid_model: Optional[nn.Module] = None
+    hybrid_state = checkpoint.get("hybrid_model_state_dict")
+    if hybrid_state is not None:
+        hybrid_model = MiniLottoTemporalHybrid(int(checkpoint["input_dim"]))
+        hybrid_model.load_state_dict(hybrid_state)
+        hybrid_model.to(CFG.device).eval()
     return PredictorBundle(
         model=model,
         scaler=checkpoint["scaler"],
@@ -1326,6 +1647,11 @@ def load_bundle(path: str = "mini_lotto_bundle.pt") -> PredictorBundle:
         modern_history=checkpoint["modern_history"],
         history_matrix=checkpoint["history_matrix"],
         input_dim=int(checkpoint["input_dim"]),
+        hybrid_model=hybrid_model,
+        hybrid_calibrator=checkpoint.get("hybrid_calibrator"),
+        hybrid_weight=float(checkpoint.get("hybrid_weight", 0.0)),
+        base_validation_metrics=checkpoint.get("base_validation_metrics"),
+        hybrid_validation_metrics=checkpoint.get("hybrid_validation_metrics"),
     )
 
 
@@ -1373,6 +1699,7 @@ def main(
     mode: str = "train",
     state_path: Optional[str] = None,
     report_path: Optional[str] = None,
+    prediction_history_path: Optional[str] = None,
 ) -> Prediction:
     mode = mode.lower().strip()
     if mode not in {"daily", "train"}:
@@ -1382,6 +1709,11 @@ def main(
     selected_path = resolve_csv_path(csv_path)
     history = load_history(selected_path)
     state_file = Path(state_path) if state_path else prediction_state_path(bundle_path)
+    prediction_history_file = (
+        Path(prediction_history_path)
+        if prediction_history_path
+        else state_file.with_name("prediction_history.csv")
+    )
     previous_prediction = load_prediction_state(state_file)
     print(f"Plik: {selected_path}")
     print(f"Tryb: {'codzienna predykcja' if mode == 'daily' else 'pełny trening'}")
@@ -1390,10 +1722,11 @@ def main(
     print(history[["Numer", "Date", *NUMBER_COLUMNS]].tail(1).to_string(index=False))
 
     latest_draw_number = int(get_modern_history(history).iloc[-1]["Numer"])
-    if (
+    prediction_is_pending = (
         previous_prediction is not None
         and previous_prediction.draw_number > latest_draw_number
-    ):
+    )
+    if prediction_is_pending and mode == "daily":
         print(
             f"Brak nowego losowania: prognoza na losowanie "
             f"{previous_prediction.draw_number} nadal oczekuje na wynik. "
@@ -1428,6 +1761,26 @@ def main(
         bundle = train_predictor(history)
         save_bundle(bundle, bundle_path)
 
+    # Pełny trening powinien dojść do skutku także wtedy, gdy czekamy jeszcze
+    # na wynik prognozowanego losowania. Po zapisaniu nowego bundle kończymy
+    # jednak bez tworzenia kolejnych zestawów i bez nadpisywania raportu/stanu.
+    if prediction_is_pending:
+        assert previous_prediction is not None
+        print(
+            f"Model został wytrenowany i zapisany, ale prognoza na losowanie "
+            f"{previous_prediction.draw_number} nadal oczekuje na wynik. "
+            "Nie zmieniam zestawów, raportu ani pliku stanu."
+        )
+        return Prediction(
+            previous_prediction.draw_number,
+            previous_prediction.draw_date,
+            previous_prediction.set_1,
+            previous_prediction.set_2,
+            float("nan"),
+            float("nan"),
+            [],
+        )
+
     explicit_date = pd.Timestamp(next_draw_date) if next_draw_date else None
     prediction = predict_next_draw(
         bundle,
@@ -1435,6 +1788,9 @@ def main(
         previous_prediction=previous_prediction,
     )
     report = print_complete_draw_summary(history, previous_prediction, prediction)
+    update_prediction_history(
+        prediction_history_file, history, previous_prediction, prediction
+    )
     save_prediction_state(prediction, state_file)
     if report_path:
         destination = Path(report_path)
@@ -1453,6 +1809,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--bundle-path", default=None)
     parser.add_argument("--state-path", default=None)
     parser.add_argument("--report-path", default=None)
+    parser.add_argument("--prediction-history-path", default=None)
     parser.add_argument(
         "--mode", choices=("daily", "train"), default="train",
         help="daily używa zapisanego modelu; train wykonuje pełny trening",
@@ -1477,4 +1834,5 @@ if __name__ == "__main__":
         mode=arguments.mode,
         state_path=arguments.state_path,
         report_path=arguments.report_path,
+        prediction_history_path=arguments.prediction_history_path,
     )
