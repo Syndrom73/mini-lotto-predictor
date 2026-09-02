@@ -22,9 +22,9 @@ on:
       - "requirements.txt"
   schedule:
     # Dwa czasy UTC obsługują zmianę czasu w Polsce. Dalej przechodzi tylko
-    # uruchomienie przypadające o 23:30 w strefie Europe/Warsaw.
+    # uruchomienie przypadające o 22:30 w strefie Europe/Warsaw.
+    - cron: "30 20 * * *"
     - cron: "30 21 * * *"
-    - cron: "30 22 * * *"
 
 permissions:
   contents: write
@@ -51,8 +51,8 @@ jobs:
           scheduled_cron="${{ github.event.schedule }}"
           warsaw_offset="$(TZ=Europe/Warsaw date +%z)"
 
-          if [[ "$warsaw_offset" == "+0200" && "$scheduled_cron" == "30 21 * * *" ]] || \
-             [[ "$warsaw_offset" == "+0100" && "$scheduled_cron" == "30 22 * * *" ]]; then
+          if [[ "$warsaw_offset" == "+0200" && "$scheduled_cron" == "30 20 * * *" ]] || \
+             [[ "$warsaw_offset" == "+0100" && "$scheduled_cron" == "30 21 * * *" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -88,7 +88,15 @@ jobs:
 
       - name: Pobierz i zweryfikuj wyniki
         if: steps.time_gate.outputs.run == 'true'
-        run: python -m automation.download_results --output wyniki-minilotto.csv
+        shell: bash
+        run: |
+          freshness_arg=""
+          if [[ "${{ github.event_name }}" == "schedule" ]]; then
+            freshness_arg="--require-today"
+          fi
+          python -m automation.download_results \
+            --output wyniki-minilotto.csv \
+            $freshness_arg
 
       - name: Wybierz tryb
         if: steps.time_gate.outputs.run == 'true'
