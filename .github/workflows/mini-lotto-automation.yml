@@ -17,6 +17,9 @@ on:
       - main
     paths:
       - ".github/workflows/mini-lotto-automation.yml"
+      - "mini_lotto_predictor.py"
+      - "automation/**"
+      - "requirements.txt"
   schedule:
     # Dwa czasy UTC obsługują zmianę czasu w Polsce. Dalej przechodzi tylko
     # uruchomienie przypadające o 23:30 w strefie Europe/Warsaw.
