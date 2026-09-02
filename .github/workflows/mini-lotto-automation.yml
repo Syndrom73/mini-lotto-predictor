@@ -12,6 +12,11 @@ on:
           - auto
           - daily
           - train
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/mini-lotto-automation.yml"
   schedule:
     # Dwa czasy UTC obsługują zmianę czasu w Polsce. Dalej przechodzi tylko
     # uruchomienie przypadające o 23:30 w strefie Europe/Warsaw.
