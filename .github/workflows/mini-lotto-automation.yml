@@ -21,10 +21,12 @@ on:
       - "automation/**"
       - "requirements.txt"
   schedule:
-    # Dwa czasy UTC obsługują zmianę czasu w Polsce. Dalej przechodzi tylko
-    # uruchomienie przypadające o 22:30 w strefie Europe/Warsaw.
+    # Pierwsza próba: 22:30, druga: 23:00 czasu polskiego. Pary UTC
+    # obsługują zmianę czasu; bramka poniżej wybiera właściwe wpisy.
     - cron: "30 20 * * *"
+    - cron: "0 21 * * *"
     - cron: "30 21 * * *"
+    - cron: "0 22 * * *"
 
 permissions:
   contents: write
@@ -51,8 +53,8 @@ jobs:
           scheduled_cron="${{ github.event.schedule }}"
           warsaw_offset="$(TZ=Europe/Warsaw date +%z)"
 
-          if [[ "$warsaw_offset" == "+0200" && "$scheduled_cron" == "30 20 * * *" ]] || \
-             [[ "$warsaw_offset" == "+0100" && "$scheduled_cron" == "30 21 * * *" ]]; then
+          if [[ "$warsaw_offset" == "+0200" && ( "$scheduled_cron" == "30 20 * * *" || "$scheduled_cron" == "0 21 * * *" ) ]] || \
+             [[ "$warsaw_offset" == "+0100" && ( "$scheduled_cron" == "30 21 * * *" || "$scheduled_cron" == "0 22 * * *" ) ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -88,18 +90,22 @@ jobs:
 
       - name: Pobierz i zweryfikuj wyniki
         if: steps.time_gate.outputs.run == 'true'
+        id: results
         shell: bash
         run: |
-          freshness_arg=""
-          if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            freshness_arg="--require-today"
+          freshness_args=()
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "push" ]]; then
+            freshness_args=(
+              --require-predicted-draw
+              --state-path .automation/last_prediction.json
+            )
           fi
           python -m automation.download_results \
             --output wyniki-minilotto.csv \
-            $freshness_arg
+            "${freshness_args[@]}"
 
       - name: Wybierz tryb
-        if: steps.time_gate.outputs.run == 'true'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         shell: bash
         run: |
           requested="${{ inputs.mode }}"
@@ -115,7 +121,7 @@ jobs:
           echo "Wybrany tryb: $mode"
 
       - name: Uruchom analizę i predykcję
-        if: steps.time_gate.outputs.run == 'true'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         run: |
           python mini_lotto_predictor.py \
             --mode "$RUN_MODE" \
@@ -126,7 +132,7 @@ jobs:
             --prediction-history-path .automation/prediction_history.csv
 
       - name: Utwórz kopię raportu
-        if: steps.time_gate.outputs.run == 'true'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         shell: bash
         run: |
           draw_number="$(grep -m1 -oP 'PO LOSOWANIU MINI LOTTO \K[0-9]+' reports/latest.md)"
@@ -135,14 +141,14 @@ jobs:
           cp reports/latest.md "reports/archive/${report_date}_losowanie_${draw_number}.md"
 
       - name: Zachowaj wytrenowany model
-        if: steps.time_gate.outputs.run == 'true' && env.RUN_MODE == 'train'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true' && env.RUN_MODE == 'train'
         uses: actions/cache/save@v4
         with:
           path: .automation/mini_lotto_bundle.pt
           key: mini-lotto-model-v3-${{ github.run_id }}
 
       - name: Udostępnij raport jako artefakt
-        if: steps.time_gate.outputs.run == 'true'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: mini-lotto-report-${{ github.run_number }}
@@ -153,7 +159,7 @@ jobs:
           retention-days: 90
 
       - name: Zapisz raport i stan w repozytorium
-        if: steps.time_gate.outputs.run == 'true'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"

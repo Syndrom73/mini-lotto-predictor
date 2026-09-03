@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import urllib.request
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from mini_lotto_predictor import NUMBER_COLUMNS, load_history
 
@@ -16,14 +15,35 @@ from mini_lotto_predictor import NUMBER_COLUMNS, load_history
 # https://www.multipasko.pl/wyniki-lotto/express-lotek
 DEFAULT_URL = "https://www.multipasko.pl/wyniki-csv.php?f=minilotto-sortowane"
 SOURCE_PAGE = "https://www.multipasko.pl/wyniki-lotto/express-lotek"
-WARSAW = ZoneInfo("Europe/Warsaw")
+
+
+def expected_draw_from_state(state_path: Path) -> int | None:
+    """Zwraca numer losowania, dla którego zapisano ostatnią prognozę."""
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        expected = int(state["draw_number"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Nie można odczytać oczekiwanego losowania z {state_path}.") from exc
+    if expected <= 0:
+        raise RuntimeError(f"Nieprawidłowy numer losowania w {state_path}: {expected}.")
+    return expected
+
+
+def write_github_output(new_data: bool) -> None:
+    """Udostępnia wynik kolejnym krokom GitHub Actions."""
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write(f"new_data={'true' if new_data else 'false'}\n")
 
 
 def download(
     url: str,
     destination: Path,
-    require_today: bool = False,
-) -> None:
+    expected_draw_number: int | None = None,
+) -> bool:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "mini-lotto-predictor/1.0 (+GitHub Actions)"},
@@ -43,15 +63,26 @@ def download(
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
     latest = history.iloc[-1]
+    latest_number = int(latest["Numer"])
     latest_date = latest["Date"].date()
-    warsaw_today = datetime.now(WARSAW).date()
-    if require_today and latest_date != warsaw_today:
+
+    # Numer prognozowanego losowania jest stabilnym identyfikatorem. Nie używamy
+    # bieżącej daty, ponieważ GitHub może uruchomić zaplanowane zadanie po północy.
+    if expected_draw_number is not None and latest_number < expected_draw_number:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError(
-            "MultiPasko nie opublikowało jeszcze dzisiejszego wyniku Mini Lotto: "
-            f"ostatnia data w źródle to {latest_date}, oczekiwano {warsaw_today}. "
-            "Model nie zostanie uruchomiony na nieaktualnych danych."
+        print(
+            "Nowy wynik nie jest jeszcze dostępny: "
+            f"źródło kończy się na losowaniu {latest_number} z {latest_date}, "
+            f"oczekiwane losowanie to {expected_draw_number}."
+        )
+        return False
+
+    if expected_draw_number is not None and latest_number > expected_draw_number:
+        print(
+            f"Uwaga: oczekiwano losowania {expected_draw_number}, ale źródło zawiera już "
+            f"losowanie {latest_number}. Analiza użyje najnowszej kompletnej historii."
         )
 
     os.replace(temporary, destination)
@@ -59,20 +90,29 @@ def download(
     numbers = " ".join(f"{int(latest[column]):02d}" for column in NUMBER_COLUMNS)
     print(f"Źródło: {SOURCE_PAGE}")
     print(f"Pobrano i zweryfikowano {len(history)} losowań.")
-    print(f"Ostatnie: {int(latest['Numer'])}, {latest['Date'].date()}, {numbers}")
+    print(f"Ostatnie: {latest_number}, {latest_date}, {numbers}")
+    return True
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--output", default="wyniki-minilotto.csv")
+    parser.add_argument("--state-path", default=".automation/last_prediction.json")
     parser.add_argument(
-        "--require-today",
+        "--require-predicted-draw",
         action="store_true",
-        help="Przerwij, jeżeli MultiPasko nie ma jeszcze wyniku z dzisiejszej daty.",
+        help="Uruchom analizę dopiero, gdy źródło zawiera prognozowany numer losowania.",
     )
     args = parser.parse_args()
-    download(args.url, Path(args.output), require_today=args.require_today)
+
+    expected = (
+        expected_draw_from_state(Path(args.state_path))
+        if args.require_predicted_draw
+        else None
+    )
+    new_data = download(args.url, Path(args.output), expected_draw_number=expected)
+    write_github_output(new_data)
 
 
 if __name__ == "__main__":
