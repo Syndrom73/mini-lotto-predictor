@@ -94,7 +94,7 @@ jobs:
         shell: bash
         run: |
           freshness_args=()
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             freshness_args=(
               --require-predicted-draw
               --state-path .automation/last_prediction.json
