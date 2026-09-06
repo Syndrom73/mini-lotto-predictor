@@ -930,6 +930,9 @@ class PredictorBundle:
     hybrid_weight: float = 0.0
     base_validation_metrics: Optional[EvaluationMetrics] = None
     hybrid_validation_metrics: Optional[EvaluationMetrics] = None
+    learned_through: int = 0
+    model_revision: int = 0
+    model_generation: str = "legacy-v3"
 
 
 def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
@@ -1005,13 +1008,18 @@ def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
     print_metrics("TEST — KOŃCOWY ENSEMBLE", test_metrics)
     print_metrics("ANALITYCZNY RANDOM BASELINE", random_metrics)
 
-    return PredictorBundle(
+    bundle = PredictorBundle(
         training.model, data.scaler, calibrator, weight,
         validation_metrics, test_metrics, random_metrics,
         modern, history, X.shape[1],
         hybrid_training.model, hybrid_calibrator, hybrid_weight,
         base_validation_metrics, hybrid_validation_metrics,
     )
+    # Test metrics above describe the untouched evaluation model only.
+    bundle.learned_through = int(modern.iloc[val_history_start - 1]["Numer"])
+    bundle.model_generation = datetime.now(timezone.utc).isoformat()
+    online_update(bundle, history_df)
+    return bundle
 
 
 def infer_next_draw_date(modern_history: pd.DataFrame) -> pd.Timestamp:
@@ -1585,6 +1593,9 @@ def save_bundle(bundle: PredictorBundle, path: str = "mini_lotto_bundle.pt") -> 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "learned_through": bundle.learned_through,
+        "model_revision": bundle.model_revision,
+        "model_generation": bundle.model_generation,
         "feature_version": FEATURE_VERSION,
         "config": asdict(CFG),
         "input_dim": bundle.input_dim,
@@ -1605,7 +1616,9 @@ def save_bundle(bundle: PredictorBundle, path: str = "mini_lotto_bundle.pt") -> 
         "base_validation_metrics": bundle.base_validation_metrics,
         "hybrid_validation_metrics": bundle.hybrid_validation_metrics,
     }
-    torch.save(payload, destination)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
     print(f"Pełny bundle zapisany: {destination.resolve()}")
 
 
@@ -1652,6 +1665,9 @@ def load_bundle(path: str = "mini_lotto_bundle.pt") -> PredictorBundle:
         hybrid_weight=float(checkpoint.get("hybrid_weight", 0.0)),
         base_validation_metrics=checkpoint.get("base_validation_metrics"),
         hybrid_validation_metrics=checkpoint.get("hybrid_validation_metrics"),
+        learned_through=int(checkpoint.get("learned_through", 0)),
+        model_revision=int(checkpoint.get("model_revision", 0)),
+        model_generation=checkpoint.get("model_generation", "legacy-v3"),
     )
 
 
@@ -1676,6 +1692,100 @@ def refresh_bundle_history(
 # ============================================================
 # 13. MAIN
 # ============================================================
+
+def online_update(bundle: PredictorBundle, history: pd.DataFrame) -> int:
+    """Supervised replay update; each new target enters once, oldest first.
+
+    Replay deliberately revisits older examples to reduce forgetting. Offline
+    test scores are never recomputed on this production model.
+    """
+    modern = get_modern_history(history)
+    X, Y = build_dataset(modern)
+    numbers = modern.iloc[dataset_offset():]["Numer"].to_numpy(dtype=int)
+    if not bundle.learned_through:
+        # Migration from v3: the last validation+test rows had no gradients.
+        bundle.learned_through = int(bundle.modern_history.iloc[
+            -CFG.validation_size - CFG.test_size - 1]["Numer"])
+    pending = np.flatnonzero(numbers > bundle.learned_through)
+    if not len(pending):
+        refresh_bundle_history(bundle, history)
+        return 0
+    scaled = bundle.scaler.transform(X).astype(np.float32)
+    models = [bundle.model]
+    if bundle.hybrid_model is not None:
+        models.append(bundle.hybrid_model)
+    for index in pending:
+        rng = np.random.default_rng(SEED + int(numbers[index]))
+        replay = rng.choice(index, size=min(index, 127), replace=False)
+        selected = np.concatenate([replay, [index]])
+        xb = torch.as_tensor(scaled[selected], device=CFG.device)
+        yb = torch.as_tensor(Y[selected], device=CFG.device)
+        for model in models:
+            # Freeze BatchNorm statistics and dropout for small daily updates.
+            model.eval()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5,
+                                          weight_decay=CFG.weight_decay)
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                loss = WeightedBCE()(model(xb), yb)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Niefinitywna strata douczania")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            if not all(torch.isfinite(p).all() for p in model.parameters()):
+                raise FloatingPointError("Niefinitywne wagi po douczaniu")
+        bundle.learned_through = int(numbers[index])
+        bundle.model_revision += 1
+    refresh_bundle_history(bundle, history)
+    print(f"Douczanie: {len(pending)} nowych wyników; do {bundle.learned_through}.")
+    return len(pending)
+
+
+def audit_probability_archive(path: Path, history: pd.DataFrame) -> dict:
+    """Score only forecasts actually saved before their target was available."""
+    archive = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    for key, record in archive.items():
+        matching = history.loc[history["Numer"] == int(key)]
+        if matching.empty or "evaluation" in record:
+            continue
+        if int(record["source_draw_number"]) >= int(key):
+            raise ValueError("Prognoza zawiera dane ocenianego losowania")
+        actual = _draw_numbers(matching.iloc[0])
+        target = numbers_to_multihot(actual)
+        p = np.asarray(record["probabilities"], dtype=float)
+        if p.shape != (42,) or not np.isfinite(p).all() or ((p < 0) | (p > 1)).any():
+            raise ValueError("Niepoprawny wektor prawdopodobieństw")
+        record["evaluation"] = {
+            "actual": actual,
+            "brier": float(np.mean((p - target) ** 2)),
+            "uniform_brier": float((5 / 42) * (1 - 5 / 42)),
+            "set_1_hits": len(set(actual) & set(record["set_1"])),
+            "set_2_hits": len(set(actual) & set(record["set_2"])),
+        }
+    return archive
+
+
+def save_probability_archive(path: Path, archive: dict, prediction: Prediction,
+                             bundle: PredictorBundle) -> None:
+    key = str(prediction.next_draw_number)
+    if key not in archive:
+        scores = dict(prediction.ranking)
+        archive[key] = {
+            "source_draw_number": int(bundle.modern_history.iloc[-1]["Numer"]),
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "draw_date": prediction.next_draw_date.date().isoformat(),
+            "model_revision": bundle.model_revision,
+            "model_generation": bundle.model_generation,
+            "learned_through": bundle.learned_through,
+            "probabilities": [float(scores[n]) for n in range(1, 43)],
+            "set_1": list(prediction.set_1), "set_2": list(prediction.set_2),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(archive, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
 
 def resolve_csv_path(explicit_path: Optional[str] = None) -> str:
     candidates = [
@@ -1715,6 +1825,8 @@ def main(
         else state_file.with_name("prediction_history.csv")
     )
     previous_prediction = load_prediction_state(state_file)
+    probability_path = state_file.with_name("probability_history.json")
+    probability_archive = audit_probability_archive(probability_path, history)
     print(f"Plik: {selected_path}")
     print(f"Tryb: {'codzienna predykcja' if mode == 'daily' else 'pełny trening'}")
     print(f"Pełny snapshot: {len(history)} losowań")
@@ -1747,8 +1859,9 @@ def main(
             raise FileNotFoundError(
                 f"Brak zapisanego modelu {bundle_path}. Najpierw uruchom tryb train."
             )
-        bundle = refresh_bundle_history(load_bundle(bundle_path), history)
-        print("Wczytano zapisany model; pominięto trening i walk-forward.")
+        bundle = load_bundle(bundle_path)
+        online_update(bundle, history)
+        save_bundle(bundle, bundle_path)
     else:
         modern = get_modern_history(history)
         X, Y = build_dataset(modern)
@@ -1788,6 +1901,27 @@ def main(
         previous_prediction=previous_prediction,
     )
     report = print_complete_draw_summary(history, previous_prediction, prediction)
+    report += (
+        f"\nDOUCZANIE: wagi zaktualizowane do losowania {bundle.learned_through}; "
+        f"rewizja {bundle.model_revision}.\n"
+        f"Udział bazowego MLP: {bundle.ensemble_weight:.0%}; "
+        f"udział CNN w końcowej mieszance: {bundle.hybrid_weight:.0%}.\n"
+        "Metryki testu historycznego dotyczą modelu sprzed douczania. "
+        "Kalibracja i udziały modeli są dobierane podczas pełnego treningu.\n"
+        "Wyniki gry są losowe; predykcja nie gwarantuje wygranej.\n"
+    )
+    evaluations = [r["evaluation"] for r in probability_archive.values()
+                   if "evaluation" in r]
+    if evaluations:
+        report += (
+            f"OCENA ZAPISANYCH PROGNOZ: {len(evaluations)} losowań; "
+            f"średni Brier {np.mean([e['brier'] for e in evaluations]):.6f}; "
+            f"punkt odniesienia {(5/42)*(37/42):.6f}.\n"
+            f"Średnie trafienia rzeczywistych zestawów: "
+            f"Z1 {np.mean([e['set_1_hits'] for e in evaluations]):.3f}/5, "
+            f"Z2 {np.mean([e['set_2_hits'] for e in evaluations]):.3f}/5.\n"
+        )
+    save_probability_archive(probability_path, probability_archive, prediction, bundle)
     update_prediction_history(
         prediction_history_file, history, previous_prediction, prediction
     )

@@ -77,8 +77,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .automation/mini_lotto_bundle.pt
-          key: mini-lotto-model-v3-restore-placeholder
+          key: mini-lotto-model-v4-restore-placeholder
           restore-keys: |
+            mini-lotto-model-v4-
             mini-lotto-model-v3-
 
       - name: Zainstaluj biblioteki
@@ -141,11 +142,11 @@ jobs:
           cp reports/latest.md "reports/archive/${report_date}_losowanie_${draw_number}.md"
 
       - name: Zachowaj wytrenowany model
-        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true' && env.RUN_MODE == 'train'
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         uses: actions/cache/save@v4
         with:
           path: .automation/mini_lotto_bundle.pt
-          key: mini-lotto-model-v3-${{ github.run_id }}
+          key: mini-lotto-model-v4-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Udostępnij raport jako artefakt
         if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
@@ -156,6 +157,8 @@ jobs:
             reports/latest.md
             .automation/last_prediction.json
             .automation/prediction_history.csv
+            .automation/probability_history.json
+            .automation/mini_lotto_bundle.pt
           retention-days: 90
 
       - name: Zapisz raport i stan w repozytorium
@@ -165,6 +168,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           files=(.automation/last_prediction.json reports/latest.md reports/archive/)
+          if [[ -f .automation/probability_history.json ]]; then
+            files+=(.automation/probability_history.json)
+          fi
           if [[ -f .automation/prediction_history.csv ]]; then
             files+=(.automation/prediction_history.csv)
           fi
