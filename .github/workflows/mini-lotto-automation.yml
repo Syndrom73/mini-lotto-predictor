@@ -89,6 +89,10 @@ jobs:
           python -m pip install numpy pandas scipy scikit-learn
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Sprawdź douczanie i harmonogram
+        if: steps.time_gate.outputs.run == 'true'
+        run: python -m unittest discover -s tests -v
+
       - name: Pobierz i zweryfikuj wyniki
         if: steps.time_gate.outputs.run == 'true'
         id: results
@@ -110,10 +114,19 @@ jobs:
         shell: bash
         run: |
           requested="${{ inputs.mode }}"
-          weekday="$(TZ=Europe/Warsaw date +%u)"
+          due="$(python - <<'PYTHON'
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          from automation.training_schedule import training_due
+          stamp = Path('.automation/last_full_training.txt')
+          print('true' if training_due(datetime.now(ZoneInfo('Europe/Warsaw')).date(),
+                stamp.read_text().strip() if stamp.exists() else None) else 'false')
+          PYTHON
+          )"
           if [[ "$requested" == "train" ]] || [[ "$requested" == "daily" ]]; then
             mode="$requested"
-          elif [[ ! -f .automation/mini_lotto_bundle.pt ]] || [[ "$weekday" == "7" ]]; then
+          elif [[ ! -f .automation/mini_lotto_bundle.pt ]] || [[ "$due" == "true" ]]; then
             mode="train"
           else
             mode="daily"
@@ -131,6 +144,10 @@ jobs:
             --state-path .automation/last_prediction.json \
             --report-path reports/latest.md \
             --prediction-history-path .automation/prediction_history.csv
+
+      - name: Zapisz datę poprawnego pełnego treningu
+        if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true' && env.RUN_MODE == 'train'
+        run: TZ=Europe/Warsaw date +%F > .automation/last_full_training.txt
 
       - name: Utwórz kopię raportu
         if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
@@ -174,6 +191,9 @@ jobs:
           if [[ -f .automation/prediction_history.csv ]]; then
             files+=(.automation/prediction_history.csv)
           fi
+          if [[ -f .automation/last_full_training.txt ]]; then
+            files+=(.automation/last_full_training.txt)
+          fi
           git add -f "${files[@]}"
           if git diff --cached --quiet; then
             echo "Brak nowych zmian do zapisania."
@@ -181,3 +201,4 @@ jobs:
             git commit -m "Automatyczny raport Mini Lotto"
             git push
           fi
+

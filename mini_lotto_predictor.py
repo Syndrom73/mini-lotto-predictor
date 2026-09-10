@@ -935,7 +935,7 @@ class PredictorBundle:
     model_generation: str = "legacy-v3"
 
 
-def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
+def train_predictor(history_df: pd.DataFrame, probability_archive: Optional[dict] = None) -> PredictorBundle:
     print("\n==============================")
     print("MINI LOTTO MODEL TRAINING")
     print("==============================")
@@ -1018,7 +1018,7 @@ def train_predictor(history_df: pd.DataFrame) -> PredictorBundle:
     # Test metrics above describe the untouched evaluation model only.
     bundle.learned_through = int(modern.iloc[val_history_start - 1]["Numer"])
     bundle.model_generation = datetime.now(timezone.utc).isoformat()
-    online_update(bundle, history_df)
+    online_update(bundle, history_df, probability_archive)
     return bundle
 
 
@@ -1693,12 +1693,44 @@ def refresh_bundle_history(
 # 13. MAIN
 # ============================================================
 
-def online_update(bundle: PredictorBundle, history: pd.DataFrame) -> int:
+def feedback_weight(record: Optional[dict], draw_number: int) -> float:
+    """Bounded experimental emphasis; never use an unscored/future forecast."""
+    if not record or "evaluation" not in record:
+        return 1.0
+    if int(record["source_draw_number"]) >= draw_number:
+        raise ValueError("Feedback zawiera dane ocenianego losowania")
+    evaluation = record["evaluation"]
+    brier = float(evaluation["brier"])
+    hits = [int(evaluation[key]) for key in ("set_1_hits", "set_2_hits")]
+    if not math.isfinite(brier) or not 0 <= brier <= 1 or any(not 0 <= h <= 5 for h in hits):
+        raise ValueError("Niepoprawne metryki feedbacku")
+    baseline = (5 / 42) * (37 / 42)
+    brier_excess = min(1.0, max(0.0, brier / baseline - 1.0))
+    hit_deficit = max(0.0, 1.0 - (sum(hits) / 2) / (25 / 42))
+    return 1.0 + 0.25 * brier_excess + 0.25 * hit_deficit
+
+
+def feedback_loss(logits: torch.Tensor, targets: torch.Tensor,
+                  weights: torch.Tensor) -> torch.Tensor:
+    # Weighted BCE logits encode class reweighting; undo its odds multiplier
+    # before using sigmoid probabilities in the differentiable Brier term.
+    ratio = (CFG.n_numbers - CFG.draw_size) / CFG.draw_size
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=logits.new_full((CFG.n_numbers,), ratio),
+        reduction="none").mean(dim=1)
+    probabilities = torch.sigmoid(logits - math.log(ratio))
+    brier = ((probabilities - targets) ** 2).mean(dim=1)
+    return ((bce + brier) * weights).sum() / weights.sum()
+
+
+def online_update(bundle: PredictorBundle, history: pd.DataFrame,
+                  probability_archive: Optional[dict] = None) -> int:
     """Supervised replay update; each new target enters once, oldest first.
 
     Replay deliberately revisits older examples to reduce forgetting. Offline
     test scores are never recomputed on this production model.
     """
+    probability_archive = probability_archive or {}
     modern = get_modern_history(history)
     X, Y = build_dataset(modern)
     numbers = modern.iloc[dataset_offset():]["Numer"].to_numpy(dtype=int)
@@ -1720,6 +1752,10 @@ def online_update(bundle: PredictorBundle, history: pd.DataFrame) -> int:
         selected = np.concatenate([replay, [index]])
         xb = torch.as_tensor(scaled[selected], device=CFG.device)
         yb = torch.as_tensor(Y[selected], device=CFG.device)
+        weights = xb.new_tensor([
+            feedback_weight(probability_archive.get(str(numbers[j])), int(numbers[j]))
+            for j in selected
+        ])
         for model in models:
             # Freeze BatchNorm statistics and dropout for small daily updates.
             model.eval()
@@ -1727,7 +1763,7 @@ def online_update(bundle: PredictorBundle, history: pd.DataFrame) -> int:
                                           weight_decay=CFG.weight_decay)
             for _ in range(2):
                 optimizer.zero_grad(set_to_none=True)
-                loss = WeightedBCE()(model(xb), yb)
+                loss = feedback_loss(model(xb), yb, weights)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Niefinitywna strata douczania")
                 loss.backward()
@@ -1860,7 +1896,7 @@ def main(
                 f"Brak zapisanego modelu {bundle_path}. Najpierw uruchom tryb train."
             )
         bundle = load_bundle(bundle_path)
-        online_update(bundle, history)
+        online_update(bundle, history, probability_archive)
         save_bundle(bundle, bundle_path)
     else:
         modern = get_modern_history(history)
@@ -1871,7 +1907,7 @@ def main(
         # Ponownie ustawiamy bazowe ziarno, aby wynik głównego modelu nie zależał
         # od liczby foldów walk-forward.
         set_seed(SEED)
-        bundle = train_predictor(history)
+        bundle = train_predictor(history, probability_archive)
         save_bundle(bundle, bundle_path)
 
     # Pełny trening powinien dojść do skutku także wtedy, gdy czekamy jeszcze
@@ -1908,6 +1944,7 @@ def main(
         f"udział CNN w końcowej mieszance: {bundle.hybrid_weight:.0%}.\n"
         "Metryki testu historycznego dotyczą modelu sprzed douczania. "
         "Kalibracja i udziały modeli są dobierane podczas pełnego treningu.\n"
+        "Feedback: BCE + Brier sieci; oceny Brier i trafień ważą przykłady 1–1.5.\n"
         "Wyniki gry są losowe; predykcja nie gwarantuje wygranej.\n"
     )
     evaluations = [r["evaluation"] for r in probability_archive.values()
@@ -1970,3 +2007,4 @@ if __name__ == "__main__":
         report_path=arguments.report_path,
         prediction_history_path=arguments.prediction_history_path,
     )
+

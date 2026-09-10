@@ -91,5 +91,35 @@ class OnlineLearningTests(unittest.TestCase):
                             for k,v in self.bundle.model.state_dict().items()))
 
 
+
+
+class FeedbackTests(unittest.TestCase):
+    def test_bounds_and_future_rejection(self):
+        self.assertEqual(m.feedback_weight(None, 140), 1)
+        record = {'source_draw_number':139, 'evaluation':{
+            'brier':1., 'set_1_hits':0, 'set_2_hits':0}}
+        self.assertEqual(m.feedback_weight(record,140),1.5)
+        record['source_draw_number']=140
+        with self.assertRaises(ValueError):
+            m.feedback_weight(record,140)
+
+    def test_brier_loss_is_finite_and_weights_change_gradient(self):
+        logits = torch.zeros((2,42), requires_grad=True)
+        targets = torch.zeros_like(logits)
+        targets[0,:5]=1; targets[1,5:10]=1
+        a=m.feedback_loss(logits, targets, torch.ones(2))
+        ga=torch.autograd.grad(a,logits)[0]
+        b=m.feedback_loss(logits, targets, torch.tensor([1.5,1.]))
+        gb=torch.autograd.grad(b,logits)[0]
+        self.assertTrue(torch.isfinite(b))
+        self.assertFalse(torch.equal(ga,gb))
+
+    def test_two_days_across_month_boundary(self):
+        from automation.training_schedule import training_due
+        from datetime import date
+        self.assertTrue(training_due(date(2026,9,10),None))
+        self.assertFalse(training_due(date(2026,10,1),'2026-09-30'))
+        self.assertTrue(training_due(date(2026,10,2),'2026-09-30'))
+
 if __name__ == '__main__':
     unittest.main()
