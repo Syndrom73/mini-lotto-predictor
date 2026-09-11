@@ -90,6 +90,8 @@ class Config:
     epochs: int = 120
     batch_size: int = 128
     patience: int = 15
+    # Experimental pairwise ranking term; 0 disables it for comparison.
+    ranking_loss_weight: float = 0.10
 
     # Ensemble
     default_nn_weight: float = 0.60
@@ -512,6 +514,19 @@ class MiniLottoTemporalHybrid(nn.Module):
         return self.head(torch.cat((self.temporal(sequence), self.context(context)), dim=1))
 
 
+def pairwise_ranking_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Per-draw mean softplus(negative logit - positive logit).
+
+    Only positive/negative pairs within the same draw participate (5*37).
+    Stable for extreme logits; rows without valid pairs contribute zero.
+    """
+    differences = logits.unsqueeze(1) - logits.unsqueeze(2)
+    pairs = (targets.unsqueeze(2) > 0.5) & (targets.unsqueeze(1) < 0.5)
+    losses = torch.nn.functional.softplus(differences)
+    return losses.masked_fill(~pairs, 0.0).sum(dim=(1, 2)) / pairs.sum(
+        dim=(1, 2)).clamp_min(1)
+
+
 class WeightedBCE(nn.Module):
     def __init__(self):
         super().__init__()
@@ -520,7 +535,8 @@ class WeightedBCE(nn.Module):
         self.loss = nn.BCEWithLogitsLoss(pos_weight=weight)
 
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return self.loss(prediction, target)
+        return (self.loss(prediction, target)
+                + CFG.ranking_loss_weight * pairwise_ranking_loss(prediction, target).mean())
 
 
 @dataclass
@@ -1720,7 +1736,8 @@ def feedback_loss(logits: torch.Tensor, targets: torch.Tensor,
         reduction="none").mean(dim=1)
     probabilities = torch.sigmoid(logits - math.log(ratio))
     brier = ((probabilities - targets) ** 2).mean(dim=1)
-    return ((bce + brier) * weights).sum() / weights.sum()
+    ranking = pairwise_ranking_loss(logits, targets)
+    return ((bce + brier + CFG.ranking_loss_weight * ranking) * weights).sum() / weights.sum()
 
 
 def online_update(bundle: PredictorBundle, history: pd.DataFrame,
@@ -1944,7 +1961,8 @@ def main(
         f"udział CNN w końcowej mieszance: {bundle.hybrid_weight:.0%}.\n"
         "Metryki testu historycznego dotyczą modelu sprzed douczania. "
         "Kalibracja i udziały modeli są dobierane podczas pełnego treningu.\n"
-        "Feedback: BCE + Brier sieci; oceny Brier i trafień ważą przykłady 1–1.5.\n"
+        f"Feedback: BCE + Brier + ranking (waga {CFG.ranking_loss_weight:g}); "
+        "oceny Brier i trafień ważą przykłady 1–1.5.\n"
         "Wyniki gry są losowe; predykcja nie gwarantuje wygranej.\n"
     )
     evaluations = [r["evaluation"] for r in probability_archive.values()
@@ -2007,4 +2025,5 @@ if __name__ == "__main__":
         report_path=arguments.report_path,
         prediction_history_path=arguments.prediction_history_path,
     )
+
 
