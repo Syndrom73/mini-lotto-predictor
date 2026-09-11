@@ -175,6 +175,7 @@ jobs:
             .automation/last_prediction.json
             .automation/prediction_history.csv
             .automation/probability_history.json
+            .automation/model_comparison.json
             .automation/mini_lotto_bundle.pt
           retention-days: 90
 
@@ -193,6 +194,9 @@ jobs:
           fi
           if [[ -f .automation/last_full_training.txt ]]; then
             files+=(.automation/last_full_training.txt)
+          fi
+          if [[ -f .automation/model_comparison.json ]]; then
+            files+=(.automation/model_comparison.json)
           fi
           git add -f "${files[@]}"
           if git diff --cached --quiet; then
