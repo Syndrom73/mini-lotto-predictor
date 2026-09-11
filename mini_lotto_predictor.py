@@ -43,6 +43,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from io import StringIO
 from itertools import combinations
+from functools import lru_cache
 from math import comb
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -844,6 +845,11 @@ def set_fitness(
     )
 
 
+@lru_cache(maxsize=2)
+def candidate_indexes(n_numbers: int, draw_size: int) -> np.ndarray:
+    return np.asarray(list(combinations(range(n_numbers), draw_size)), dtype=np.int16)
+
+
 def exact_best_set(
     probabilities: np.ndarray,
     pair_matrix: np.ndarray,
@@ -860,22 +866,21 @@ def exact_best_set(
             raise ValueError("Limit wspólnych liczb musi należeć do zakresu 0..5.")
         constraints.append((set(numbers), int(limit)))
 
-    best_set: Optional[Individual] = None
-    best_fitness = -float("inf")
-    for candidate in combinations(range(1, CFG.n_numbers + 1), CFG.draw_size):
-        candidate_numbers = set(candidate)
-        if any(
-            len(candidate_numbers & blocked) > limit
-            for blocked, limit in constraints
-        ):
-            continue
-        value = set_fitness(candidate, probabilities, pair_matrix)
-        if value > best_fitness:
-            best_set = candidate
-            best_fitness = value
-    if best_set is None:
+    candidates = candidate_indexes(CFG.n_numbers, CFG.draw_size)
+    valid = np.ones(len(candidates), dtype=bool)
+    for blocked, limit in constraints:
+        valid &= np.isin(candidates, np.asarray(list(blocked)) - 1).sum(axis=1) <= limit
+    candidates = candidates[valid]
+    if not len(candidates):
         raise RuntimeError("Nie znaleziono zestawu spełniającego ograniczenia overlapu.")
-    return best_set, best_fitness
+    scores = CFG.individual_score_weight * probabilities[candidates].sum(axis=1)
+    pair_scores = np.zeros(len(candidates))
+    for a, b in combinations(range(CFG.draw_size), 2):
+        pair_scores += pair_matrix[candidates[:, a], candidates[:, b]]
+    scores += CFG.pair_score_weight * pair_scores / comb(CFG.draw_size, 2)
+    scores += CFG.spread_weight * (candidates[:, -1] - candidates[:, 0]) / (CFG.n_numbers - 1)
+    best = int(np.argmax(scores))
+    return tuple(int(n) + 1 for n in candidates[best]), float(scores[best])
 
 
 @dataclass
@@ -951,7 +956,8 @@ class PredictorBundle:
     model_generation: str = "legacy-v3"
 
 
-def train_predictor(history_df: pd.DataFrame, probability_archive: Optional[dict] = None) -> PredictorBundle:
+def train_predictor(history_df: pd.DataFrame, probability_archive: Optional[dict] = None,
+                    finalize: bool = True) -> PredictorBundle:
     print("\n==============================")
     print("MINI LOTTO MODEL TRAINING")
     print("==============================")
@@ -1034,7 +1040,8 @@ def train_predictor(history_df: pd.DataFrame, probability_archive: Optional[dict
     # Test metrics above describe the untouched evaluation model only.
     bundle.learned_through = int(modern.iloc[val_history_start - 1]["Numer"])
     bundle.model_generation = datetime.now(timezone.utc).isoformat()
-    online_update(bundle, history_df, probability_archive)
+    if finalize:
+        online_update(bundle, history_df, probability_archive)
     return bundle
 
 
@@ -1765,7 +1772,9 @@ def online_update(bundle: PredictorBundle, history: pd.DataFrame,
         models.append(bundle.hybrid_model)
     for index in pending:
         rng = np.random.default_rng(SEED + int(numbers[index]))
-        replay = rng.choice(index, size=min(index, 127), replace=False)
+        # Keep recent past examples out of this update as a regression guard.
+        guard_start = max(0, index - 32) if index >= 64 else index
+        replay = rng.choice(guard_start, size=min(guard_start, 127), replace=False)
         selected = np.concatenate([replay, [index]])
         xb = torch.as_tensor(scaled[selected], device=CFG.device)
         yb = torch.as_tensor(Y[selected], device=CFG.device)
@@ -1776,6 +1785,14 @@ def online_update(bundle: PredictorBundle, history: pd.DataFrame,
         for model in models:
             # Freeze BatchNorm statistics and dropout for small daily updates.
             model.eval()
+            before = copy.deepcopy(model.state_dict())
+            guard_x = torch.as_tensor(scaled[guard_start:index], device=CFG.device)
+            guard_y = torch.as_tensor(Y[guard_start:index], device=CFG.device)
+            def guard_score():
+                with torch.no_grad():
+                    return feedback_loss(model(guard_x), guard_y,
+                                         guard_x.new_ones(len(guard_x))).item()
+            baseline = guard_score() if len(guard_x) else None
             optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5,
                                           weight_decay=CFG.weight_decay)
             for _ in range(2):
@@ -1788,6 +1805,11 @@ def online_update(bundle: PredictorBundle, history: pd.DataFrame,
                 optimizer.step()
             if not all(torch.isfinite(p).all() for p in model.parameters()):
                 raise FloatingPointError("Niefinitywne wagi po douczaniu")
+            if baseline is not None:
+                after = guard_score()
+                if not math.isfinite(after) or after > baseline + 1e-6:
+                    model.load_state_dict(before)
+                    print(f"Kontrola douczania {numbers[index]}: cofnięto aktualizację {type(model).__name__}.")
         bundle.learned_through = int(numbers[index])
         bundle.model_revision += 1
     refresh_bundle_history(bundle, history)
@@ -1918,13 +1940,11 @@ def main(
     else:
         modern = get_modern_history(history)
         X, Y = build_dataset(modern)
-        if CFG.walk_forward_enabled:
-            expanding_walk_forward(modern, X, Y)
-
-        # Ponownie ustawiamy bazowe ziarno, aby wynik głównego modelu nie zależał
-        # od liczby foldów walk-forward.
-        set_seed(SEED)
-        bundle = train_predictor(history, probability_archive)
+        # Equal-budget ranking comparison replaces additional walk-forward fits.
+        import sys
+        from model_experiments import run_comparison
+        bundle = run_comparison(sys.modules[__name__], history, probability_archive,
+                                state_file.with_name("model_comparison.json"))
         save_bundle(bundle, bundle_path)
 
     # Pełny trening powinien dojść do skutku także wtedy, gdy czekamy jeszcze
@@ -1975,6 +1995,8 @@ def main(
             f"Średnie trafienia rzeczywistych zestawów: "
             f"Z1 {np.mean([e['set_1_hits'] for e in evaluations]):.3f}/5, "
             f"Z2 {np.mean([e['set_2_hits'] for e in evaluations]):.3f}/5.\n"
+            f"Co najmniej jeden zestaw z >=3/5: "
+            f"{np.mean([max(e['set_1_hits'], e['set_2_hits']) >= 3 for e in evaluations]):.2%}.\n"
         )
     save_probability_archive(probability_path, probability_archive, prediction, bundle)
     update_prediction_history(
@@ -2025,5 +2047,3 @@ if __name__ == "__main__":
         report_path=arguments.report_path,
         prediction_history_path=arguments.prediction_history_path,
     )
-
-
