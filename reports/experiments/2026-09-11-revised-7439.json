@@ -1,0 +1,21 @@
+{
+  "draw": 7439,
+  "date": "2026-09-11",
+  "set_1": [
+    1,
+    5,
+    22,
+    34,
+    42
+  ],
+  "set_2": [
+    3,
+    11,
+    26,
+    36,
+    41
+  ],
+  "source_draw": 7438,
+  "method": "Full ranking training plus guarded replay; original production ticket filters",
+  "note": "Requested rerun; identical sets to original prediction. Historical comparison did not demonstrate improved hit rate."
+}
