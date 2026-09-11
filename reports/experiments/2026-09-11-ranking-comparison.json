@@ -1,0 +1,230 @@
+{
+  "evaluation_draws_per_block": 50,
+  "note": "Exploratory validation; untouched chronological test. No parameter selection from test.",
+  "variants": {
+    "0.0": {
+      "validation": {
+        "first_draw": 6989,
+        "last_draw": 7038,
+        "brier": 0.10487511670245508,
+        "sets": {
+          "production": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.54,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "no_rotation": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.64,
+            "set_2_mean_hits": 0.52,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "no_pair_score": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.44,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "probabilities_only": {
+            "draws": 50,
+            "any_set_ge3": 0.02,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.52,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          }
+        }
+      },
+      "test": {
+        "first_draw": 7389,
+        "last_draw": 7438,
+        "brier": 0.10487491115914246,
+        "sets": {
+          "production": {
+            "draws": 50,
+            "any_set_ge3": 0.02,
+            "set_1_mean_hits": 0.52,
+            "set_2_mean_hits": 0.72,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "no_rotation": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.54,
+            "set_2_mean_hits": 0.7,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "no_pair_score": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.62,
+            "set_2_mean_hits": 0.48,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "probabilities_only": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.8,
+            "set_2_mean_hits": 0.46,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          }
+        }
+      }
+    },
+    "0.1": {
+      "validation": {
+        "first_draw": 6989,
+        "last_draw": 7038,
+        "brier": 0.10487509856308053,
+        "sets": {
+          "production": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.54,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "no_rotation": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.64,
+            "set_2_mean_hits": 0.52,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "no_pair_score": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.44,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          },
+          "probabilities_only": {
+            "draws": 50,
+            "any_set_ge3": 0.02,
+            "set_1_mean_hits": 0.56,
+            "set_2_mean_hits": 0.52,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0194,
+              "set_1_mean_hits": 0.6068,
+              "set_2_mean_hits": 0.6118
+            }
+          }
+        }
+      },
+      "test": {
+        "first_draw": 7389,
+        "last_draw": 7438,
+        "brier": 0.10487487074944857,
+        "sets": {
+          "production": {
+            "draws": 50,
+            "any_set_ge3": 0.02,
+            "set_1_mean_hits": 0.52,
+            "set_2_mean_hits": 0.72,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "no_rotation": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.54,
+            "set_2_mean_hits": 0.7,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "no_pair_score": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.62,
+            "set_2_mean_hits": 0.48,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          },
+          "probabilities_only": {
+            "draws": 50,
+            "any_set_ge3": 0.0,
+            "set_1_mean_hits": 0.8,
+            "set_2_mean_hits": 0.46,
+            "random_reference": {
+              "draws": 5000,
+              "any_set_ge3": 0.0148,
+              "set_1_mean_hits": 0.5952,
+              "set_2_mean_hits": 0.5936
+            }
+          }
+        }
+      }
+    }
+  }
+}
