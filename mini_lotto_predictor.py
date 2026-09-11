@@ -1975,7 +1975,7 @@ def main(
     )
     report = print_complete_draw_summary(history, previous_prediction, prediction)
     report += (
-        f"\nDOUCZANIE: wagi zaktualizowane do losowania {bundle.learned_through}; "
+        f"\nDOUCZANIE: wyniki przetworzone do losowania {bundle.learned_through}; "
         f"rewizja {bundle.model_revision}.\n"
         f"Udział bazowego MLP: {bundle.ensemble_weight:.0%}; "
         f"udział CNN w końcowej mieszance: {bundle.hybrid_weight:.0%}.\n"
@@ -1983,6 +1983,7 @@ def main(
         "Kalibracja i udziały modeli są dobierane podczas pełnego treningu.\n"
         f"Feedback: BCE + Brier + ranking (waga {CFG.ranking_loss_weight:g}); "
         "oceny Brier i trafień ważą przykłady 1–1.5.\n"
+        "Kontrola douczania cofa aktualizacje pogarszające wynik na wcześniejszych przykładach.\n"
         "Wyniki gry są losowe; predykcja nie gwarantuje wygranej.\n"
     )
     evaluations = [r["evaluation"] for r in probability_archive.values()
