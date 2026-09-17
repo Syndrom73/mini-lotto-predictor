@@ -1562,7 +1562,9 @@ def _emit_complete_draw_summary(
     print("=" * 62)
     print(f"ZESTAW 1: {_format_numbers(next_prediction.set_1)}")
     print(f"ZESTAW 2: {_format_numbers(next_prediction.set_2)}")
-    if next_prediction.hybrid_weight > 0.0:
+    if getattr(next_prediction, "backend", "legacy") == "catboost":
+        print("CatBoost Ranker: aktywny; dwa rozłączne zestawy z rankingu liczb.")
+    elif next_prediction.hybrid_weight > 0.0:
         print(
             "Temporalny CNN+MLP: aktywny w ensemble, udział "
             f"{100 * next_prediction.hybrid_weight:.0f}%"
@@ -1880,12 +1882,19 @@ def resolve_csv_path(explicit_path: Optional[str] = None) -> str:
 def main(
     csv_path: Optional[str] = None,
     next_draw_date: Optional[str] = None,
-    bundle_path: str = "mini_lotto_bundle.pt",
+    bundle_path: str = "mini_lotto_catboost.zip",
     mode: str = "train",
     state_path: Optional[str] = None,
     report_path: Optional[str] = None,
     prediction_history_path: Optional[str] = None,
+    backend: str = "catboost",
 ) -> Prediction:
+    if backend == "catboost":
+        from ranker_pipeline import main as ranker_main
+        return ranker_main(csv_path, next_draw_date, bundle_path, mode, state_path,
+                           report_path, prediction_history_path)
+    if backend != "legacy":
+        raise ValueError("Unknown backend")
     mode = mode.lower().strip()
     if mode not in {"daily", "train"}:
         raise ValueError("Tryb musi mieć wartość 'daily' albo 'train'.")
@@ -2016,6 +2025,7 @@ def main(
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analiza i predykcja Mini Lotto")
+    parser.add_argument("--backend", choices=("catboost", "legacy"), default="catboost")
     parser.add_argument("--csv-path", default=None)
     parser.add_argument("--next-draw-date", default=None)
     parser.add_argument("--bundle-path", default=None)
@@ -2039,7 +2049,10 @@ if __name__ == "__main__":
         if GOOGLE_DRIVE_ROOT.is_dir()
         else Path("mini_lotto_bundle.pt")
     )
+    if arguments.backend == "catboost":
+        default_bundle_path = str(Path(default_bundle_path).with_name("mini_lotto_catboost.zip"))
     main(
+        backend=arguments.backend,
         csv_path=arguments.csv_path,
         next_draw_date=arguments.next_draw_date,
         bundle_path=arguments.bundle_path or default_bundle_path,
@@ -2048,3 +2061,4 @@ if __name__ == "__main__":
         report_path=arguments.report_path,
         prediction_history_path=arguments.prediction_history_path,
     )
+

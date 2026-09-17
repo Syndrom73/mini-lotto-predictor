@@ -1,0 +1,40 @@
+name: CatBoost validation
+on:
+  pull_request:
+    paths:
+      - '**.py'
+      - 'requirements.txt'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      historical:
+        description: 'Run the independent historical benchmark (including legacy scores)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - name: Download historical snapshot
+        if: github.event_name == 'workflow_dispatch' && inputs.historical
+        run: python -m automation.download_results --output wyniki-minilotto.csv
+      - name: Independent historical test
+        if: github.event_name == 'workflow_dispatch' && inputs.historical
+        run: python ranker_backtest.py --csv-path wyniki-minilotto.csv --output benchmark/catboost-holdout.json --legacy
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.historical
+        with:
+          name: catboost-historical-test
+          path: benchmark/catboost-holdout.json
