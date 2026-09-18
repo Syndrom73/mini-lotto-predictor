@@ -3,3 +3,5 @@ pandas
 scipy
 scikit-learn
 torch
+
+catboost==1.2.8

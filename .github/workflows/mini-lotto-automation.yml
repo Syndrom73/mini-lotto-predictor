@@ -18,6 +18,9 @@ on:
     paths:
       - ".github/workflows/mini-lotto-automation.yml"
       - "mini_lotto_predictor.py"
+      - "catboost_ranker.py"
+      - "ranker_pipeline.py"
+      - "ranker_backtest.py"
       - "automation/**"
       - "requirements.txt"
   schedule:
@@ -32,7 +35,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: mini-lotto-automation
+  group: mini-lotto-automation-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -76,17 +79,16 @@ jobs:
         id: model_cache
         uses: actions/cache/restore@v4
         with:
-          path: .automation/mini_lotto_bundle.pt
-          key: mini-lotto-model-v4-restore-placeholder
+          path: .automation/mini_lotto_catboost.zip
+          key: mini-lotto-catboost-v1-restore-placeholder
           restore-keys: |
-            mini-lotto-model-v4-
-            mini-lotto-model-v3-
+            mini-lotto-catboost-v1-
 
       - name: Zainstaluj biblioteki
         if: steps.time_gate.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy pandas scipy scikit-learn
+          python -m pip install numpy pandas scipy scikit-learn catboost==1.2.8
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Sprawdź douczanie i harmonogram
@@ -126,7 +128,7 @@ jobs:
           )"
           if [[ "$requested" == "train" ]] || [[ "$requested" == "daily" ]]; then
             mode="$requested"
-          elif [[ ! -f .automation/mini_lotto_bundle.pt ]] || [[ "$due" == "true" ]]; then
+          elif [[ ! -f .automation/mini_lotto_catboost.zip ]] || [[ "$due" == "true" ]]; then
             mode="train"
           else
             mode="daily"
@@ -137,10 +139,10 @@ jobs:
       - name: Uruchom analizę i predykcję
         if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         run: |
-          python mini_lotto_predictor.py \
+          python mini_lotto_predictor.py --backend catboost \
             --mode "$RUN_MODE" \
             --csv-path wyniki-minilotto.csv \
-            --bundle-path .automation/mini_lotto_bundle.pt \
+            --bundle-path .automation/mini_lotto_catboost.zip \
             --state-path .automation/last_prediction.json \
             --report-path reports/latest.md \
             --prediction-history-path .automation/prediction_history.csv
@@ -162,8 +164,8 @@ jobs:
         if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
         uses: actions/cache/save@v4
         with:
-          path: .automation/mini_lotto_bundle.pt
-          key: mini-lotto-model-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .automation/mini_lotto_catboost.zip
+          key: mini-lotto-catboost-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Udostępnij raport jako artefakt
         if: steps.time_gate.outputs.run == 'true' && steps.results.outputs.new_data == 'true'
@@ -176,7 +178,7 @@ jobs:
             .automation/prediction_history.csv
             .automation/probability_history.json
             .automation/model_comparison.json
-            .automation/mini_lotto_bundle.pt
+            .automation/mini_lotto_catboost.zip
           retention-days: 90
 
       - name: Zapisz raport i stan w repozytorium
@@ -205,4 +207,5 @@ jobs:
             git commit -m "Automatyczny raport Mini Lotto"
             git push
           fi
+
 
